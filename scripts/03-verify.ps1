@@ -21,7 +21,10 @@
         .\03-verify.ps1 -DecoyIP 114.114.114.114     换个诱饵地址
         .\03-verify.ps1 -TestAnthropic               额外直接验证 Anthropic 规则（见下）
 
-    退出码：0 = 全部通过；1 = 有项目没通过。
+    退出码：
+      0 = 全部验证通过
+      1 = 有项目验证失败（规则没生效）
+      2 = 有项目无法验证（测试环境不满足，结论不完整 —— 不等于通过）
 #>
 
 [CmdletBinding()]
@@ -87,6 +90,7 @@ Info "诱饵地址：$DecoyIP : $DecoyPort"
 
 $pass = @()
 $fail = @()
+$skip = @()          # 想测但测不了的项。绝不能当成通过。
 $routesAdded = @()
 
 try {
@@ -130,32 +134,61 @@ try {
 
     $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
     if (-not (Test-Path $curl)) {
-        Warn "找不到 $curl，跳过按程序封的测试。"
+        Warn "系统里没有 curl.exe，这一项无法验证。"
+        $skip += '按程序封（找不到 curl.exe）'
     } else {
-        New-NetFirewallRule -DisplayName 'KS VERIFY - prog' -Group $TestGroup `
-            -Direction Outbound -Action Block -Profile Any `
-            -Program $curl -RemoteAddress $DecoyIP -InterfaceAlias $phys | Out-Null
-        Start-Sleep -Milliseconds 500
+        # baseline 和加规则后必须用【完全相同】的命令，否则比较没有意义。
+        # -k 是刻意加的：我们要测的是「连不连得上」，不是「证书对不对」。
+        # 不能靠「curl 退出码非零」来推断被阻断 —— 证书错误、TLS 握手失败、
+        # 服务端不说 HTTPS，都会让退出码非零，那样会得到假阳性。
+        $curlArgs = @(
+            '--noproxy', '*', '-k', '-sS', '--max-time', '6',
+            '-o', 'NUL', "https://${DecoyIP}:${DecoyPort}/"
+        )
 
-        & $curl --noproxy '*' -sS --max-time 6 "https://$DecoyIP/" 2>&1 | Out-Null
-        $curlBlocked = ($LASTEXITCODE -ne 0)
-        $otherStillOk = Test-Tcp $DecoyIP $DecoyPort
+        & $curl @curlArgs 2>&1 | Out-Null
+        $baseCode = $LASTEXITCODE
 
-        if ($curlBlocked -and $otherStillOk) {
-            Ok "curl 被挡住，同一时刻其他程序访问同一地址仍然通"
-            Info "这组对比排除了「其实是网络本身出问题」，证明防火墙确实在按程序路径区分。"
-            $pass += '按程序封'
-        } elseif (-not $curlBlocked) {
-            Bad "curl 没被挡住 —— 按程序路径的规则没有生效"
-            Info "完整防护那一层很可能是摆设。请反馈这个结果。"
-            $fail += '按程序封'
+        if ($baseCode -ne 0) {
+            # 一条规则都没有的时候 curl 就失败了 —— 那么「加规则后 curl 失败」
+            # 什么都证明不了。这种情况必须报「无法验证」，绝不能算通过。
+            Bad "基线不成立：没有任何规则时 curl 就失败了（退出码 $baseCode）"
+            Info '这不是防火墙的问题，是这个诱饵地址不适合用 curl 测（可能没有 HTTPS 服务）。'
+            Info '换一个 HTTP(S) 服务正常的诱饵地址再试：'
+            Info '  .\03-verify.ps1 -DecoyIP <地址> -DecoyPort <端口>'
+            $skip += '按程序封（curl 基线不成立）'
         } else {
-            Bad "curl 被挡住了，但其他程序也连不上 —— 说明规则范围过大或网络本身有问题"
-            Info "这个结果不能证明按程序区分是有效的。"
-            $fail += '按程序封'
-        }
+            Info "基线：curl 直连成功（退出码 0）"
 
-        Get-NetFirewallRule -Group $TestGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+            New-NetFirewallRule -DisplayName 'KS VERIFY - prog' -Group $TestGroup `
+                -Direction Outbound -Action Block -Profile Any `
+                -Program $curl -RemoteAddress $DecoyIP -InterfaceAlias $phys | Out-Null
+            Start-Sleep -Milliseconds 500
+
+            & $curl @curlArgs 2>&1 | Out-Null
+            $afterCode = $LASTEXITCODE
+            $otherStillOk = Test-Tcp $DecoyIP $DecoyPort
+
+            Info "加规则后：curl 退出码 $afterCode；其他程序访问同一地址：$(if ($otherStillOk) { '仍然通' } else { '也不通' })"
+
+            if ($afterCode -ne 0 -and $otherStillOk) {
+                Ok "同一个程序、同一条命令：加规则前成功，加规则后失败"
+                Ok "同一时刻另一个程序访问同一个地址仍然通"
+                Info '这组 A/B 同时排除了「网络本身有问题」和「证书之类的其他失败原因」，'
+                Info '证明防火墙确实在按程序路径区分。'
+                $pass += '按程序封'
+            } elseif ($afterCode -eq 0) {
+                Bad "加了规则 curl 依然成功 —— 按程序路径的规则没有生效"
+                Info '完整防护那一层很可能是摆设。请反馈这个结果。'
+                $fail += '按程序封'
+            } else {
+                Bad "curl 被挡住了，但其他程序也连不上 —— 规则范围过大，或网络本身出了问题"
+                Info '这个结果不能证明按程序区分是有效的。'
+                $fail += '按程序封'
+            }
+
+            Get-NetFirewallRule -Group $TestGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        }
     }
 
     # ================================== 可选：直接验证 Anthropic 规则 ====
@@ -198,23 +231,30 @@ finally {
 # ====================================================== 结论 ====
 Write-Host ''
 Write-Host ('─' * 70) -ForegroundColor DarkGray
-if ($fail.Count -eq 0 -and $pass.Count -gt 0) {
-    Write-Host '  全部通过：' -ForegroundColor Green -NoNewline
-    Write-Host " $($pass -join '、')"
-    Write-Host ''
-    Info '这说明本方案依赖的两种规则写法在你这台机器上都确实会开火。'
-    Info '你装的规则不是摆设。'
+
+if ($pass.Count -gt 0) { Write-Host "  通过：    $($pass -join '、')" -ForegroundColor Green }
+if ($skip.Count -gt 0) { Write-Host "  无法验证：$($skip -join '、')" -ForegroundColor Yellow }
+if ($fail.Count -gt 0) { Write-Host "  没通过：  $($fail -join '、')" -ForegroundColor Red }
+
+Write-Host ''
+if ($fail.Count -gt 0) {
+    Info '在弄清楚原因之前，请【不要】认为自己已经受保护。'
+    $code = 1
+} elseif ($skip.Count -gt 0) {
+    Info '通过的部分是可信的，但有项目【没能验证】—— 那不等于它是好的，只是没测出来。'
+    Info '按上面的提示换个诱饵地址重跑，把它变成明确的结论。'
+    $code = 2
+} elseif ($pass.Count -gt 0) {
+    Info '本方案依赖的两种规则写法在你这台机器上都确实会开火。你装的规则不是摆设。'
     Write-Host ''
     Info '想做最后的端到端验证（真的把代理弄没，看 Claude 会不会漏），'
     Info '见 docs/verification.md —— 那里有一套不会产生真实泄漏的做法。'
     $code = 0
 } else {
-    Write-Host '  有项目没通过：' -ForegroundColor Red -NoNewline
-    Write-Host " $($fail -join '、')"
-    Write-Host ''
-    Info '在弄清楚原因之前，请【不要】认为自己已经受保护。'
-    $code = 1
+    Info '一项都没跑起来。'
+    $code = 2
 }
 Write-Host ('─' * 70) -ForegroundColor DarkGray
 Write-Host ''
+# 退出码：0 = 全部验证通过；1 = 有项目验证失败；2 = 有项目无法验证（结论不完整）
 exit $code

@@ -72,23 +72,47 @@ $pfn = if ($pkg) { $pkg.PackageFamilyName } else { 'Claude_pzs8sxrjxfjjc' }
 # Windows 在真正替换文件几小时前就会把新版本的完整包名写进日志（事件 574 / 855），
 # 而且不会在 Claude 运行时替换文件（事件 638）。所以我们可以在新程序还不存在的时候
 # 就为它建好规则 —— 防火墙接受指向不存在路径的规则。这才是消除更新竞态的办法。
+
+# MSIX 包全名的格式是   Name_Version_Architecture__PublisherId
+# 架构可能是 x86 / x64 / arm / arm64 / neutral，不能写死。
+# 从 PackageFamilyName 拆出 Name 和 PublisherId 来约束匹配（避免误伤日志里别的应用），
+# 架构那一段保持开放，并且【从日志里原样提取完整包名】，不自己拼接。
+$pkgName = $pfn -replace '_[^_]+$', ''
+$pubId   = ($pfn -split '_')[-1]
+$fullNameRx = '{0}_[0-9][0-9.]*_(?:x86|x64|arm|arm64|neutral)__{1}' -f
+              [regex]::Escape($pkgName), [regex]::Escape($pubId)
+
+# 未来的版本里该给哪些文件建规则？用【当前版本的相对路径】当模板，
+# 比硬编码一串文件名准确，而且包结构变了会自动跟上。
+$relTemplate = @()
+if ($pkg -and $pkg.InstallLocation -and (Test-Path $pkg.InstallLocation)) {
+    $base = $pkg.InstallLocation.TrimEnd('\')
+    $relTemplate = @(
+        Get-ChildItem $base -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName.Substring($base.Length).TrimStart('\') }
+    )
+}
+if ($relTemplate.Count -eq 0) {
+    # 读不到当前包时的兜底清单
+    $relTemplate = @(
+        'app\claude.exe'
+        'app\resources\chrome-native-host.exe'
+        'app\resources\cowork-svc.exe'
+        'app\resources\app.asar.unpacked\resources\github-mcp\github-mcp-server.exe'
+    )
+}
+
 try {
-    $pattern = [regex]::Escape($pfn) -replace '^Claude_', 'Claude_[0-9][0-9.]*_x64__'
     Get-WinEvent -FilterHashtable @{
             LogName   = 'Microsoft-Windows-AppXDeploymentServer/Operational'
             StartTime = (Get-Date).AddDays(-14)
         } -MaxEvents 2000 -ErrorAction Stop |
-        ForEach-Object { [regex]::Matches($_.Message, 'Claude_[0-9][0-9.]*_x64__[a-z0-9]+') } |
+        ForEach-Object { [regex]::Matches($_.Message, $fullNameRx) } |
         ForEach-Object { $_.Value } |
         Sort-Object -Unique |
         ForEach-Object {
-            $app = Join-Path (Join-Path $env:ProgramFiles 'WindowsApps') (Join-Path $_ 'app')
-            @(
-                'claude.exe'
-                'resources\chrome-native-host.exe'
-                'resources\cowork-svc.exe'
-                'resources\app.asar.unpacked\resources\github-mcp\github-mcp-server.exe'
-            ) | ForEach-Object { $targets.Add((Join-Path $app $_)) }
+            $pkgRoot = Join-Path (Join-Path $env:ProgramFiles 'WindowsApps') $_
+            foreach ($rel in $relTemplate) { $targets.Add((Join-Path $pkgRoot $rel)) }
         }
 } catch {
     Write-Log "WARN: 读不到 AppX 部署日志：$($_.Exception.Message)"
