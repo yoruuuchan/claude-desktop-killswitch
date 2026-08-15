@@ -1,0 +1,10 @@
+# 运行时产物，不该进仓库
+*.log
+ks-mark.txt
+task.xml
+
+# Windows / 编辑器杂物
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
