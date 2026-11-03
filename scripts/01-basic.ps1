@@ -1,4 +1,4 @@
-﻿<#
+<#
     Claude 防直连 —— 基础防护（十分钟版）
 
     按【目的地】拦：任何程序都不能从物理网卡直连 Anthropic 的自有网段。
@@ -56,7 +56,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Fail '需要管理员权限。请用「以管理员身份运行」打开 PowerShell 再试。'
 }
 
-$phys = @((Get-NetAdapter -Physical -ErrorAction SilentlyContinue).Name)
+$phys = @((Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -ne 'Not Present' }).Name)
 if ($phys.Count -eq 0) { Fail '找不到物理网卡。' }
 Ok "物理网卡：$($phys -join '、')"
 

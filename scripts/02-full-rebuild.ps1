@@ -1,4 +1,4 @@
-﻿<#
+<#
     Claude 防直连 —— 按进程封的规则重建脚本
 
     这个脚本【不需要你手动跑】。02-full-install.ps1 会把它复制到
@@ -50,7 +50,8 @@ $Public4 = @(
 # 公网 IPv6 = 全球单播 + NAT64。不含 fe80::/10 和 fc00::/7（Tailscale 的 ULA 在这里）。
 $Public6 = @('2000::/3', '64:ff9b::/96', '64:ff9b:1::/48')
 
-$phys = @((Get-NetAdapter -Physical -ErrorAction SilentlyContinue).Name)
+$phys = @((Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -ne 'Not Present' }).Name)
 if ($phys.Count -eq 0) {
     Write-Log 'ABORT: 看不到任何物理网卡，未做任何改动。'
     exit 1

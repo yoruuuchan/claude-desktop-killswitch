@@ -1,4 +1,4 @@
-﻿<#
+<#
     Claude 防直连 —— 环境体检
 
     这是一个【只读】脚本：不创建、不修改、不删除任何东西。
@@ -37,7 +37,8 @@ Write-Host '  Claude 防直连 —— 环境体检（只读，不会改动任何
 # ---------------------------------------------------------------- 网卡 ----
 Section '1. 网卡'
 
-$phys = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue)
+$phys = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+          Where-Object { $_.Status -ne 'Not Present' })
 if ($phys.Count -eq 0) {
     Bad '找不到任何物理网卡。这套方案没法用。'
     $findings.Add('NO_PHYSICAL')

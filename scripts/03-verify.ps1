@@ -1,4 +1,4 @@
-﻿<#
+<#
     Claude 防直连 —— 验证规则真的会开火
 
     ────────────────────────────────────────────────────────────────
@@ -68,7 +68,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit 1
 }
 
-$phys = @((Get-NetAdapter -Physical -ErrorAction SilentlyContinue).Name)
+$phys = @((Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -ne 'Not Present' }).Name)
 if ($phys.Count -eq 0) { Bad '找不到物理网卡。'; exit 1 }
 
 # 找一条走物理网卡的默认路由，用它的网关来做主机路由
