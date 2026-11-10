@@ -1,4 +1,4 @@
-<#
+﻿<#
     Claude 防直连 —— 验证规则真的会开火
 
     ────────────────────────────────────────────────────────────────
@@ -18,7 +18,8 @@
 
     用法（管理员 PowerShell）：
         .\03-verify.ps1
-        .\03-verify.ps1 -DecoyIP 114.114.114.114     换个诱饵地址
+        .\03-verify.ps1 -DecoyHost example.org        自动解析另一测试网站
+        .\03-verify.ps1 -DecoyHost example.com -DecoyIP 104.20.23.154
         .\03-verify.ps1 -TestAnthropic               额外直接验证 Anthropic 规则（见下）
 
     退出码：
@@ -32,9 +33,11 @@ param(
     # 诱饵地址。必须满足两个条件：
     #   1) 现在直连得通（不然测不出区别）
     #   2) 跟你的 Claude 账号毫无关系
-    # 默认阿里公共 DNS。
-    [string]$DecoyIP = '223.5.5.5',
-    [int]$DecoyPort  = 443,
+    # 默认解析 example.com，并使用正确的 HTTPS 域名（SNI）做 curl 基线。
+    # 自定义 IP 时应同时传入与它匹配的 DecoyHost。
+    [string]$DecoyIP = '',
+    [string]$DecoyHost = 'example.com',
+    [int]$DecoyPort = 443,
 
     # 额外做一次直接针对 Anthropic 规则的验证。
     # 它会把 Anthropic 的一个地址强制走物理网卡，然后尝试连接 —— 预期被你的规则挡住。
@@ -59,6 +62,19 @@ function Test-Tcp([string]$ip, [int]$port) {
     (Test-NetConnection -ComputerName $ip -Port $port -WarningAction SilentlyContinue -InformationLevel Quiet) -eq $true
 }
 
+# Keep curl's stderr from becoming a terminating PowerShell error; its exit code
+# is checked explicitly against the successful baseline instead.
+function Invoke-CurlExitCode([string]$Exe, [string[]]$Arguments) {
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Exe @Arguments 2>&1 | Out-Null
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 Write-Host ''
 Write-Host '  Claude 防直连 —— 验证' -ForegroundColor White
 
@@ -81,13 +97,29 @@ $defRoute = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyCon
 
 if (-not $defRoute) {
     Bad '找不到走物理网卡的默认路由，没法把诱饵地址强制走物理网卡。'
-    Info '如果你的代理把默认路由整个替换掉了，请先临时关掉 TUN 再跑这个脚本。'
+    Info '请保持代理开启。本次无法进行诱饵测试，无需冒险修改网络。'
     exit 1
+}
+
+if (-not $DecoyIP) {
+    if (-not $DecoyHost) {
+        Bad '必须指定 DecoyIP 或 DecoyHost。'
+        exit 2
+    }
+    try {
+        $ips = @(Resolve-DnsName -Name $DecoyHost -Type A -ErrorAction Stop |
+                 Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress)
+        if ($ips.Count -eq 0) { throw '未返回 IPv4 地址' }
+        $DecoyIP = $ips[0]
+    } catch {
+        Bad "无法解析诱饵域名 $DecoyHost：$($_.Exception.Message)"
+        exit 2
+    }
 }
 
 Info "物理网卡：$($phys -join '、')"
 Info "测试用网关：$($defRoute.NextHop)（接口 $($defRoute.ifIndex)）"
-Info "诱饵地址：$DecoyIP : $DecoyPort"
+Info "诱饵地址：$DecoyIP : $DecoyPort（域名：$DecoyHost）"
 
 $pass = @()
 $fail = @()
@@ -108,7 +140,7 @@ try {
     } else {
         Bad "基线不通 —— 这个诱饵地址本身就连不上，测不出区别。"
         Info "换一个当前直连得通的地址再试：.\03-verify.ps1 -DecoyIP <地址>"
-        exit 1
+        exit 2
     }
 
     # =========================================== 测试一：按目的地封 ====
@@ -142,21 +174,23 @@ try {
         # -k 是刻意加的：我们要测的是「连不连得上」，不是「证书对不对」。
         # 不能靠「curl 退出码非零」来推断被阻断 —— 证书错误、TLS 握手失败、
         # 服务端不说 HTTPS，都会让退出码非零，那样会得到假阳性。
-        $curlArgs = @(
-            '--noproxy', '*', '-k', '-sS', '--max-time', '6',
-            '-o', 'NUL', "https://${DecoyIP}:${DecoyPort}/"
-        )
+        $curlArgs = @('--noproxy', '*', '-k', '-sS', '--max-time', '6', '-o', 'NUL')
+        if ($DecoyHost) {
+            # --resolve pins the destination IP while preserving the hostname for TLS SNI.
+            $curlArgs += @('--resolve', "${DecoyHost}:${DecoyPort}:${DecoyIP}", "https://${DecoyHost}:${DecoyPort}/")
+        } else {
+            $curlArgs += "https://${DecoyIP}:${DecoyPort}/"
+        }
 
-        & $curl @curlArgs 2>&1 | Out-Null
-        $baseCode = $LASTEXITCODE
+        $baseCode = Invoke-CurlExitCode -Exe $curl -Arguments $curlArgs
 
         if ($baseCode -ne 0) {
             # 一条规则都没有的时候 curl 就失败了 —— 那么「加规则后 curl 失败」
             # 什么都证明不了。这种情况必须报「无法验证」，绝不能算通过。
             Bad "基线不成立：没有任何规则时 curl 就失败了（退出码 $baseCode）"
             Info '这不是防火墙的问题，是这个诱饵地址不适合用 curl 测（可能没有 HTTPS 服务）。'
-            Info '换一个 HTTP(S) 服务正常的诱饵地址再试：'
-            Info '  .\03-verify.ps1 -DecoyIP <地址> -DecoyPort <端口>'
+            Info '换一个支持 HTTPS 的诱饵域名再试：'
+            Info '  .\03-verify.ps1 -DecoyHost example.org'
             $skip += '按程序封（curl 基线不成立）'
         } else {
             Info "基线：curl 直连成功（退出码 0）"
@@ -166,8 +200,7 @@ try {
                 -Program $curl -RemoteAddress $DecoyIP -InterfaceAlias $phys | Out-Null
             Start-Sleep -Milliseconds 500
 
-            & $curl @curlArgs 2>&1 | Out-Null
-            $afterCode = $LASTEXITCODE
+            $afterCode = Invoke-CurlExitCode -Exe $curl -Arguments $curlArgs
             $otherStillOk = Test-Tcp $DecoyIP $DecoyPort
 
             Info "加规则后：curl 退出码 $afterCode；其他程序访问同一地址：$(if ($otherStillOk) { '仍然通' } else { '也不通' })"
@@ -217,6 +250,10 @@ try {
             }
         }
     }
+}
+catch {
+    Bad "测试发生异常：$($_.Exception.Message)"
+    $fail += '测试异常'
 }
 finally {
     # 无论中间出什么事，都把测试用的东西清干净
