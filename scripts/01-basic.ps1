@@ -30,9 +30,10 @@ $ErrorActionPreference = 'Stop'
 $Group = 'Claude-KS'
 
 # --------------------------------------------------------------------------
-# Anthropic 官方公布的网段（AS399358）
-# 来源：https://platform.claude.com/docs/en/api/ip-addresses
-# 这些值可能变化，建议偶尔核对。
+# Anthropic inbound IP ranges from the official documentation.
+# The extra IPv6 prefix (2607:6bc0:11::/48) is also originated by AS399358.
+# Sources: https://platform.claude.com/docs/en/api/ip-addresses
+#          https://bgp.he.net/AS399358
 # --------------------------------------------------------------------------
 $AnthropicV4 = @('160.79.104.0/23', '153.61.224.0/22')
 $AnthropicV6 = @('2607:6bc0::/48', '2607:6bc0:11::/48')
