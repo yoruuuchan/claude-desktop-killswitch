@@ -28,7 +28,7 @@ Claude 照常工作，什么都不报错。你会以为自己受保护了。
 
 ## 第一阶段：证明机制可用（零风险）
 
-这一阶段由 `scripts/03-verify.ps1` 自动完成，全程不碰 Anthropic。
+这一阶段由 `scripts/03-verify.ps1` 自动完成，全程不碰 Anthropic。默认使用 `example.com`，将域名解析到一个 IPv4 后固定测试路由；curl 使用 `--resolve` 保持对应的 TLS 域名，避免直接访问 IP 时握手失败。无需关闭正在使用的系统代理。
 
 原理是用一个**跟你账号毫无关系的诱饵地址**，配合一条临时的主机路由，
 把它强制走物理网卡，然后用**构造上与正式规则完全相同**的规则去打它。
@@ -49,7 +49,7 @@ Claude 照常工作，什么都不报错。你会以为自己受保护了。
 一个很容易犯的错误是这样写：
 
 ```powershell
-curl.exe https://<诱饵地址>/
+curl.exe --noproxy '*' --resolve example.com:443:<诱饵IP> https://example.com/
 $blocked = ($LASTEXITCODE -ne 0)      # ← 错的
 ```
 
