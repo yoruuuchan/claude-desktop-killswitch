@@ -130,12 +130,47 @@ Test-NetConnection <你的节点IP> -Port <节点端口> | Select-Object TcpTest
 
 **2. 架临时全机墙**（整机立刻断网，这是故意的）
 
+IPv4 和 IPv6 各一条 —— 只封 IPv4 的话，一旦这个网络下发 IPv6（校园网、手机热点、新路由器），
+流量就从 IPv6 侧绕过整堵墙，而你以为自己是被保护着的。
+
 ```powershell
-New-NetFirewallRule -DisplayName "KS TEMP - global" -Group "Claude-KS-TEMP" `
+$phys = @((Get-NetAdapter -Physical | Where-Object { $_.Status -ne 'Not Present' }).Name)
+
+New-NetFirewallRule -DisplayName "KS TEMP - global v4" -Group "Claude-KS-TEMP" `
   -Direction Outbound -Action Block -Profile Any `
-  -RemoteAddress 1.0.0.0-9.255.255.255,11.0.0.0-100.63.255.255,100.128.0.0-126.255.255.255,128.0.0.0-169.253.255.255,169.255.0.0-172.15.255.255,172.32.0.0-192.167.255.255,192.169.0.0-223.255.255.255 `
-  -InterfaceAlias (Get-NetAdapter -Physical).Name
+  -RemoteAddress @(
+      '1.0.0.0-9.255.255.255'
+      '11.0.0.0-100.63.255.255'
+      '100.128.0.0-126.255.255.255'
+      '128.0.0.0-169.253.255.255'
+      '169.255.0.0-172.15.255.255'
+      '172.32.0.0-192.167.255.255'
+      '192.169.0.0-223.255.255.255'
+  ) `
+  -InterfaceAlias $phys
+
+New-NetFirewallRule -DisplayName "KS TEMP - global v6" -Group "Claude-KS-TEMP" `
+  -Direction Outbound -Action Block -Profile Any `
+  -RemoteAddress @('2000::/3', '64:ff9b::/96', '64:ff9b:1::/48') `
+  -InterfaceAlias $phys
 ```
+
+地址段要写成**数组**，不要拼成一个字符串 —— 字符串会被 `-RemoteAddress` 截断成第一段，
+而它**不报错**（见 README 里那一条）。
+
+**2b. 回读，确认墙真的写全了**
+
+```powershell
+Get-NetFirewallRule -Group "Claude-KS-TEMP" |
+    ForEach-Object {
+        $n = @(($_ | Get-NetFirewallAddressFilter).RemoteAddress).Count
+        $a = @(($_ | Get-NetFirewallInterfaceFilter).InterfaceAlias)
+        "{0}: {1} 段 / 网卡 {2}" -f $_.DisplayName, $n, ($a -join ',')
+    }
+```
+
+期望：v4 那条 **7 段**、v6 那条 **3 段**，网卡是物理网卡的名字（不是 `Any`）。
+段数少了、或者网卡显示 `Any`，说明墙没立好，停止测试。
 
 **3. 证明这堵墙是真的** ← 千万别跳过
 
@@ -147,6 +182,11 @@ Test-NetConnection <你的节点IP> -Port <节点端口> | Select-Object TcpTest
 
 **如果还是 `True`**：墙没立起来，后面的测试就没有保护了。
 立刻删掉规则并停止，不要继续。
+
+> **这堵墙只拦「新建连接」。** 已经建立并授权的流（Tailscale 的 UDP 隧道、正在跑的
+> 下载、已经连上的 SSH）会继续跑到自己断开为止 —— 这是 Windows 过滤平台的正常行为，
+> 不是墙漏了。对本次测试没有影响：Claude 是新进程，它每一次连接都是新流。
+> 但它意味着这堵墙的语义是「不再放行任何新的出网」，不是「物理气隙」。
 
 **4. 制造最危险的状态**
 
@@ -221,22 +261,66 @@ Windows 事件 **5157**（Filtering Platform Connection，失败审计）能给�
 应用程序路径、PID、源/目的地址端口、协议，以及 **Filter Origin —— 触发
 阻断的那条防火墙规则的 ID**（Windows 11 / Server 2022 起）。
 
-开启（管理员，会产生大量事件，建议先扩大 Security 日志）：
+2026-11 在本机实测：`FilterOrigin` 就是规则的 `Name`（GUID），拿它
+`Get-NetFirewallRule -Name <GUID>` 能直接查出是哪条规则；`Application` 是
+发起连接的 exe 路径。两者都对得上，这条证据链是可靠的。
+
+开启（管理员）。**别用子类别名字**：`/subcategory:"Filtering Platform Connection"`
+在中文本地化的 Windows 上会直接报「参数错误 0x00000057」。用 GUID：
 
 ```powershell
-auditpol /set /subcategory:"Filtering Platform Connection" /failure:enable
+# 0CCE9226 = Filtering Platform Connection
+auditpol /set /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030} /failure:enable
 ```
 
 关闭：
 
 ```powershell
-auditpol /set /subcategory:"Filtering Platform Connection" /failure:disable
+auditpol /set /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030} /failure:disable
+```
+
+确认开成了（输出里那一行应该是「失败」/`Failure`）：
+
+```powershell
+auditpol /get /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}
 ```
 
 规则 ID 反查规则名：`Get-NetFirewallRule -Name <ID>`
 
-这是唯一能证明「某个具体的 Claude 进程，被我们预期的那一条规则拦下」的办法。
-对大多数人来说不是必需的，但如果你要较真到底，这是终点。
+> **注意量**：开了之后每一次被挡的连接都会进 Security 日志。一个代理挂掉的
+> Windows 机，两分钟就能攒出几千条。测完立刻关掉，并先把防火墙日志上限调大
+> （`Set-NetFirewallProfile -All -LogMaxSizeKilobytes 32767`），否则 4 MB 轮转
+> 会把关键片段冲掉。
+
+### 关键限制：护栏一立起来，就证明不了正式规则
+
+这是本协议最容易搞错的一点，务必先看。
+
+临时墙和正式规则会**同时命中同一条流**（都覆盖 Anthropic 网段、都绑物理网卡），
+而 Windows **只报告其中一个来源**。
+
+2026-11 实测（同一台机器，两轮对照）：临时墙在的时候，Claude Code 的 101 次直连
+尝试，`FilterOrigin` **全部**指向临时墙的规则 ID；3 条正式规则在全部 7686 个事件里
+出现 **0 次**。把正式规则临时关掉再测一遍，归因结果**完全一样**。
+
+也就是说：
+
+| 你能证明的 | 你证明不了的 |
+|---|---|
+| 护栏有效（诱饵加墙前通、加墙后断） | 正式规则是否命中 |
+| 「有东西挡住了 Claude 的直连」 | 「挡住它的是我们那条规则」 |
+| fail-open 风险真实存在 | 正式规则的有效性 |
+
+**要真正证明正式规则，必须让护栏退场。** 护栏一撤，正式规则失效就是一次真实直连 ——
+所以只有「物理出口本身不存在」的环境才允许这么做：
+
+- 拔网线 / 关掉上游（路由器断 WAN，保留本机 LAN）
+- 或在一台宿主只开 host-only 网络的虚拟机里
+
+这两种情况下包根本出不去，这时才可以撤掉护栏、单独验证正式规则。
+
+**做不到就诚实写「护栏已验证、正式规则未证实」。** 把
+「加了墙、Claude 连不上」写成「正式规则已验证」，正是这个项目最想避免的那种误判。
 
 ---
 

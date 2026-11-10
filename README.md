@@ -191,6 +191,8 @@ Windows 在真正替换文件**几小时前**就会把新版本的完整包名�
 
 完整的零泄漏验证流程（包括怎么安全地做「拔掉代理」这种危险测试）见 **[docs/verification.md](docs/verification.md)**。核心思路是：**先架一层临时的全机阻断，再故意破坏代理**，这样无论被测的规则是真是假，都不可能产生一次真实的直连。
 
+注意这两件事不是一回事：这层护栏保证的是**「不会漏」**，保证不了**「证明正式规则命中」**。两者重叠时 Windows 只报告其中一个来源，护栏会盖掉归因。区别和补救办法见 [docs/verification.md](docs/verification.md) 的「关键限制：护栏一立起来，就证明不了正式规则」。
+
 ---
 
 ## 那些看起来对、但其实会漏的方案
@@ -214,6 +216,37 @@ Windows 在真正替换文件**几小时前**就会把新版本的完整包名�
 更糟的是 PowerShell 对 `-RemoteAddress` 没有取值校验 —— 关键字写错不会报错，只会生成一条**匹配不到任何东西的规则**。对一个「失败必须很吵」的方案来说，这是最差的选择。
 
 **本项目用显式网段。** 不好看，但可以逐条核对。
+
+### ❌ 把地址段拼成一个字符串传给 `-RemoteAddress`
+
+```powershell
+# 错的：看着是 7 段，实际只写进去 1 段
+$ranges = '1.0.0.0-9.255.255.255,11.0.0.0-100.63.255.255,100.128.0.0-126.255.255.255,...'
+New-NetFirewallRule -DisplayName x -Direction Outbound -Action Block -RemoteAddress $ranges ...
+```
+
+`-RemoteAddress` 收的是**数组**。传一个逗号拼接的字符串进去，它不报错、也不替你拆，只保留**第一段**，其余静默丢弃。
+
+2026-11 实测：这样建出来的规则，`(Get-NetFirewallRule ... | Get-NetFirewallAddressFilter).RemoteAddress` 只剩 `1.0.0.0-9.255.255.255` 一段。规则是 Block、也启用了，看着一切正常，实际只覆盖 1/7 的地址空间 —— 又是一个安静的 fail-open。
+
+**正确写法**（本项目全部脚本都是这个写法）：
+
+```powershell
+$ranges = @(
+    '1.0.0.0-9.255.255.255'
+    '11.0.0.0-100.63.255.255'
+    '100.128.0.0-126.255.255.255'
+    # ...
+)
+New-NetFirewallRule -DisplayName x -Direction Outbound -Action Block -RemoteAddress $ranges ...
+```
+
+**装完回读，段数对不上就是没写全**：
+
+```powershell
+Get-NetFirewallRule -Group <你的组名> | Get-NetFirewallAddressFilter |
+    ForEach-Object { "{0} 段" -f @($_.RemoteAddress).Count }
+```
 
 ### ❌ 用 Dynamic Keyword / FQDN 规则
 
