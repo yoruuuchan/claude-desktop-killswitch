@@ -159,6 +159,27 @@ $ksRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { 
 if ($ksRules.Count -gt 0) {
     Ok "本项目的规则已安装：共 $($ksRules.Count) 条"
     $ksRules | Group-Object Group | ForEach-Object { Info ("  {0,-18} {1} 条" -f $_.Name, $_.Count) }
+
+    # Windows 防火墙会把 /23、/22 读回为点分子网掩码，核对时兼容两种格式。
+    $blocked = @()
+    foreach ($rule in $ksRules) {
+        if ($rule.Enabled -ne 'True' -or $rule.Direction -ne 'Outbound' -or $rule.Action -ne 'Block') {
+            continue
+        }
+        $blocked += @(($rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue).RemoteAddress)
+    }
+    $requiredV4 = @(
+        @{ CIDR = '160.79.104.0/23'; Formats = @('160.79.104.0/23', '160.79.104.0/255.255.254.0') }
+        @{ CIDR = '153.61.224.0/22'; Formats = @('153.61.224.0/22', '153.61.224.0/255.255.252.0') }
+    )
+    foreach ($item in $requiredV4) {
+        if (@($item.Formats | Where-Object { $_ -in $blocked }).Count -gt 0) {
+            Ok "IPv4 网段已拦截：$($item.CIDR)"
+        } else {
+            Bad "IPv4 网段缺少有效阻断：$($item.CIDR)"
+            $findings.Add('V4_MISSING')
+        }
+    }
 } else {
     Info '本项目的规则：尚未安装'
 }
@@ -203,6 +224,10 @@ if ($staleOtherBlock.Count -gt 0) {
 
 # ------------------------------------------------------------ 结论 ----
 Section '结论'
+
+if ($findings -contains 'V4_MISSING') {
+    Bad '当前 IPv4 防护不完整。更新仓库脚本后重新运行 .\01-basic.ps1，补齐缺失网段。'
+}
 
 if ($findings -contains 'NO_PHYSICAL') {
     Bad '没有物理网卡，装不了。'
