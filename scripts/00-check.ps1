@@ -160,7 +160,7 @@ if ($ksRules.Count -gt 0) {
     Ok "本项目的规则已安装：共 $($ksRules.Count) 条"
     $ksRules | Group-Object Group | ForEach-Object { Info ("  {0,-18} {1} 条" -f $_.Name, $_.Count) }
 
-    # Windows 防火墙会把 /23、/22 读回为点分子网掩码，核对时兼容两种格式。
+    # Windows may return CIDR prefixes as dotted subnet masks; accept either representation.
     $blocked = @()
     foreach ($rule in $ksRules) {
         if ($rule.Enabled -ne 'True' -or $rule.Direction -ne 'Outbound' -or $rule.Action -ne 'Block') {
