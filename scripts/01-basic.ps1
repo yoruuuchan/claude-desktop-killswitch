@@ -117,8 +117,8 @@ function New-KSRule {
 }
 
 Write-Host ''
-# 保留已安装的旧 IPv4 规则，给新增网段单独加规则。
-# 旧版规则已存在时 New-KSRule 会跳过，因此只修改地址数组无法完成升级。
+# Preserve the existing IPv4 block and install the new range as a separate rule.
+# New-KSRule skips existing names, so changing only the address list would not upgrade old installs.
 New-KSRule -Name 'KS - Block Anthropic IPv4 on physical' -Remote @('160.79.104.0/23')
 New-KSRule -Name 'KS - Block Anthropic IPv4 153.61.224.0-22 on physical' -Remote @('153.61.224.0/22')
 New-KSRule -Name 'KS - Block Anthropic IPv6 on physical' -Remote $AnthropicV6
@@ -140,7 +140,7 @@ foreach ($r in (Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue)
     if ($ifa -contains 'Any') { $bad += $r.DisplayName }
 }
 
-# 检查新网段确实落在启用的阻断规则里，防止已有同名错误规则被直接跳过。
+# Verify the new range is covered by an enabled block rule, even if its name already existed.
 $newV4Rule = Get-NetFirewallRule -DisplayName 'KS - Block Anthropic IPv4 153.61.224.0-22 on physical' -ErrorAction SilentlyContinue
 $newV4Addresses = if ($newV4Rule) { @(($newV4Rule | Get-NetFirewallAddressFilter).RemoteAddress) } else { @() }
 if (-not $newV4Rule -or $newV4Rule.Enabled -ne 'True' -or
