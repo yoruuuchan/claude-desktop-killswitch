@@ -1,4 +1,4 @@
-<#
+﻿<#
     Claude 防直连 —— 按进程封的规则重建脚本
 
     这个脚本【不需要你手动跑】。02-full-install.ps1 会把它复制到
@@ -10,7 +10,7 @@
       · 每 10 分钟（兜底）
 
     ────────────────────────────────────────────────────────────────
-    两个关键设计，改动前请先理解：
+    三个关键设计，改动前请先理解：
 
     1) 只增不删。
        常见写法是「删旧规则 → 重新扫描 → 建新规则」，那中间存在一个
@@ -20,6 +20,12 @@
     2) 规则只作用在物理网卡上。
        隧道（TUN）和 Tailscale 的流量完全不受影响。只有当隧道消失、
        流量掉回网线/WiFi 时，规则才会生效。
+
+    3) 目标发现不依赖运行身份。
+       计划任务可能在无用户会话的上下文里跑，那时 Get-AppxPackage 返回空、
+       $env:APPDATA 指向 systemprofile —— 只依赖这两者的发现逻辑会全灭
+       （2026-09 实测：规则停止自动更新两个月没被发现）。所以发现只走
+       文件系统可验证的路径：WindowsApps 直接扫、C:\Users 遍历、.npmrc 解析。
     ────────────────────────────────────────────────────────────────
 
     退出码：0 = 所有发现的目标都已覆盖；1 = 有遗漏（看日志）。
@@ -58,16 +64,42 @@ if ($phys.Count -eq 0) {
 }
 
 # ============================================================ 发现目标 ====
+# 发现逻辑不依赖「任务以哪个身份跑」。
+# 踩过的坑（2026-09）：任务在无用户会话的上下文里执行时，Get-AppxPackage
+# 返回空（Appx 包按用户注册），$env:APPDATA 又指向 systemprofile，
+# 目标发现全灭 —— 规则停止自动更新两个月没人发现。
+# 所以这里只用「文件系统就能验证」的探测：WindowsApps 直接扫、用户
+# profile 遍历、.npmrc 解析，不依赖任何按用户注册的 API。
 
 $targets = [System.Collections.Generic.List[string]]::new()
 
-# --- 1. 当前安装的 MSIX 包内的所有 exe ---
-$pkg = Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($pkg -and $pkg.InstallLocation) {
-    Get-ChildItem $pkg.InstallLocation -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
+# 所有真实用户的 profile 根（比 $env:USERPROFILE 可靠：SYSTEM 跑时它指向
+# systemprofile；比 $env:APPDATA 可靠：S4U 会话里它可能为空）
+$userRoots = @((Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty FullName))
+$userRoots += $env:USERPROFILE
+$userRoots = @($userRoots | Sort-Object -Unique)
+
+# --- 1. Claude Desktop (MSIX)：Appx API + WindowsApps 直接扫描，两条腿走路 ---
+$pkgs = @()
+try { $pkgs = @(Get-AppxPackage -Name Claude -AllUsers -ErrorAction SilentlyContinue) } catch { }
+try { $pkgs += @(Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue) } catch { }
+$pkg  = $pkgs | Select-Object -First 1
+$installLocs = @($pkgs | Where-Object InstallLocation |
+    Select-Object -ExpandProperty InstallLocation -Unique)
+
+# 兜底：直接扫 WindowsApps 里的 Claude_* 目录（管理员/SYSTEM 可读）。
+# 不依赖包注册状态：卸载重装、注册表没跟上、跨用户上下文，都能发现。
+$winApps = Join-Path $env:ProgramFiles 'WindowsApps'
+if (Test-Path $winApps) {
+    $installLocs += @(Get-ChildItem $winApps -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty FullName)
+}
+foreach ($loc in ($installLocs | Sort-Object -Unique)) {
+    Get-ChildItem $loc -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
         ForEach-Object { $targets.Add($_.FullName) }
 }
-$pfn = if ($pkg) { $pkg.PackageFamilyName } else { 'Claude_pzs8sxrjxfjjc' }
+$pfn = if ($pkg -and $pkg.PackageFamilyName) { $pkg.PackageFamilyName } else { 'Claude_pzs8sxrjxfjjc' }
 
 # --- 2. 预置：从 AppX 部署日志里读出「即将安装」的包名 ---
 # Windows 在真正替换文件几小时前就会把新版本的完整包名写进日志（事件 574 / 855），
@@ -119,15 +151,67 @@ try {
     Write-Log "WARN: 读不到 AppX 部署日志：$($_.Exception.Message)"
 }
 
-# --- 3. 包目录之外的进程：扩展 / MCP / Claude Code ---
-@(
-    (Join-Path $env:APPDATA 'Claude\Claude Extensions')
-    (Join-Path $env:LOCALAPPDATA "Packages\$pfn\LocalCache\Roaming\Claude\Claude Extensions")
-    (Join-Path $env:APPDATA 'Claude\claude-code')
-) | ForEach-Object {
-    if (Test-Path $_) {
-        Get-ChildItem $_ -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
-            ForEach-Object { $targets.Add($_.FullName) }
+# --- 3. 包目录之外的进程：扩展 / MCP（遍历所有用户 profile）---
+foreach ($u in $userRoots) {
+    @(
+        (Join-Path $u 'AppData\Roaming\Claude\Claude Extensions')
+        (Join-Path $u "AppData\Local\Packages\$pfn\LocalCache\Roaming\Claude\Claude Extensions")
+        (Join-Path $u 'AppData\Roaming\Claude\claude-code')
+    ) | ForEach-Object {
+        if (Test-Path $_) {
+            Get-ChildItem $_ -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
+                ForEach-Object { $targets.Add($_.FullName) }
+        }
+    }
+}
+
+# --- 4. Claude Code CLI（npm 全局安装）---
+# npm 装的 CLI 不在 Desktop 包里，也不在扩展目录里，必须单独找。
+# 依据（对 claude.exe 2.1.322 的静态逆向，2026-11）：
+#   · CLI 的错误上报走 Sentry / Datadog，端点在 Google Cloud 网段，
+#     不在 Anthropic 网段里 —— 基础防护（按目的地）拦不住，必须按进程封。
+#   · 二进制位于 <npm prefix>\node_modules\@anthropic-ai\claude-code\bin\claude.exe，
+#     以及同包嵌套的平台包 claude-code-win32-x64\claude.exe（同一文件的硬链接）。
+$cliCandidates = [System.Collections.Generic.List[string]]::new()
+foreach ($u in $userRoots) {
+    # a) 用户 .npmrc 里自定义的 prefix=（自定义安装盘的机器只有这里能查到）
+    $npmrc = Join-Path $u '.npmrc'
+    if (Test-Path $npmrc) {
+        foreach ($line in (Get-Content $npmrc -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*prefix\s*=\s*(.+?)\s*$') {
+                $cliCandidates.Add((Join-Path $Matches[1] 'node_modules\@anthropic-ai\claude-code'))
+            }
+        }
+    }
+    # b) npm 默认全局位置
+    $cliCandidates.Add((Join-Path $u 'AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code'))
+    # c) 原生安装器位置
+    $cliCandidates.Add((Join-Path $u '.local\bin'))
+}
+# d) npm 命令自己报告 prefix（以用户身份跑时最准；SYSTEM 下没有 npm 就跳过）
+try {
+    $npm = Get-Command npm -ErrorAction Stop
+    $prefix = (& $npm.Source prefix -g 2>$null | Select-Object -First 1)
+    if ($prefix) { $cliCandidates.Add((Join-Path $prefix 'node_modules\@anthropic-ai\claude-code')) }
+} catch { }
+
+foreach ($pkgDir in ($cliCandidates | Sort-Object -Unique)) {
+    # wrapper 包的 bin（postinstall 已把真实二进制放进来）
+    $bin = Join-Path $pkgDir 'bin\claude.exe'
+    if (Test-Path $bin) { $targets.Add($bin) }
+    # 嵌套的平台包（install.cjs 的复制来源，硬链接同源）
+    $scoped = Join-Path $pkgDir 'node_modules\@anthropic-ai'
+    if (Test-Path $scoped) {
+        Get-ChildItem $scoped -Directory -Filter 'claude-code-*' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $plat = Join-Path $_.FullName 'claude.exe'
+                if (Test-Path $plat) { $targets.Add($plat) }
+            }
+    }
+    # c) 原生安装器的独立可执行文件
+    if ($pkgDir -notmatch '@anthropic-ai') {
+        $native = Join-Path $pkgDir 'claude.exe'
+        if (Test-Path $native) { $targets.Add($native) }
     }
 }
 
