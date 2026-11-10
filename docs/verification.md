@@ -184,7 +184,7 @@ foreach ($f in @("$dir\pfirewall.log", "$dir\pfirewall.log.old")) {
 }
 $new = @($lines | Where-Object { $_.Length -gt 19 -and $_.Substring(0,19) -ge $t0 })
 "本次新增日志行数: $($new.Count)"
-$new | Select-String 'DROP' | Select-String '160\.79\.104\.' | Select-Object -Last 30
+$new | Select-String 'DROP' | Select-String '(160\.79\.10[45]\.|153\.61\.22[4-7]\.)' | Select-Object -Last 30
 ```
 
 > **注意**：一定要同时查 `pfirewall.log` 和 `pfirewall.log.old`，并且按
@@ -197,7 +197,7 @@ $new | Select-String 'DROP' | Select-String '160\.79\.104\.' | Select-Object -La
 
 | 现象 | 含义 |
 |---|---|
-| 有 `160.79.104.x` 的 DROP 行 | **最有价值的结果**：Claude 确实试图直连 Anthropic，确实被拦下了。既证明了 fail-open 风险真实存在，也证明了墙在起作用 |
+| 有 Anthropic 已列入站 IPv4 网段的 DROP 行 | **最有价值的结果**：Claude 确实试图直连 Anthropic，确实被拦下了。既证明了 fail-open 风险真实存在，也证明了墙在起作用 |
 | 没有 Anthropic，但有别的 DROP | Claude 在更早的环节就失败了，没走到发起直连那一步。也是安全的，但信息量少 |
 | 一条新增都没有 | 多半是日志还没落盘，等一两分钟再跑一次；或者你用了按行号定位而日志轮转了 |
 
