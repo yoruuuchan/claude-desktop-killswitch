@@ -121,7 +121,9 @@ Anthropic 当前公布的入站 IPv4 包含 `153.61.224.0/22`。如果之前安�
 
 基础版按**目的地**拦，只覆盖 Anthropic 自己的 IP 段。但 Claude 也会连一些第三方托管的地址 —— 比如 `statsig.anthropic.com` 解析到 `34.36.57.103`，那是 Google Cloud，不在 Anthropic 网段里，按目的地拦不住。
 
-完整版补上按**进程**拦的一层：把 Claude 全家（Desktop 包内程序、扩展进程、Claude Code）从物理网卡上封掉**所有公网地址**，不看目的地。
+完整版补上按**进程**拦的一层：把 Claude 全家（Desktop 包内程序、扩展进程、Claude Code CLI）从物理网卡上封掉**所有公网地址**，不看目的地。
+
+为什么要封到「所有公网地址」而不只是 Anthropic 网段：Claude Code CLI 的错误上报走 Sentry 和 Datadog，这些端点托管在 Google Cloud 网段（`34.149.x.x` / `2600:1901::`），**不在 Anthropic 的 IP 段里**——按目的地拦不住。更麻烦的是，代理掉线时 CLI 连不上 API 这件事本身会触发错误上报（`tengu_streaming_error` 一类事件，带 `device_id` 和 `account_uuid`），等于「拦截动作自己制造泄露」。按进程封一层不看目的地，这类侧信道全部关死。
 
 ```powershell
 .\scripts\02-full-install.ps1
@@ -235,7 +237,7 @@ QUIC 走 UDP/443。本项目所有规则都不指定 `-Protocol`。
 
 ### ❌ 只封 `Claude.exe`
 
-Claude Desktop 包内还有 `cowork-svc.exe`、`chrome-native-host.exe` 等；扩展 / MCP 进程跑在**包目录之外**（`%APPDATA%\Claude\Claude Extensions\...`）；Claude Code 是另一个程序，路径也带版本号。
+Claude Desktop 包内还有 `cowork-svc.exe`、`chrome-native-host.exe` 等；扩展 / MCP 进程跑在**包目录之外**（`%APPDATA%\Claude\Claude Extensions\...`）；Claude Code 是另一个程序——npm 安装的 CLI 位于 `<npm prefix>\node_modules\@anthropic-ai\claude-code\bin\claude.exe`（路径不带版本号，npm 升级原地覆盖，不会脱靶），原生安装则在 `~\.local\bin\claude.exe`。重建脚本会从用户 `.npmrc` 的 `prefix=`、npm 默认全局位置和 `npm prefix -g` 三条线索找到它。
 
 ---
 
