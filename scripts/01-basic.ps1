@@ -2,7 +2,7 @@
     Claude 防直连 —— 基础防护（十分钟版）
 
     按【目的地】拦：任何程序都不能从物理网卡直连 Anthropic 的自有网段。
-    零维护，不会因为 Claude 更新而失效。
+    规则不依赖 Claude 客户端版本；官方 IP 网段有更新时需要补充。
 
     用法（管理员 PowerShell）：
         .\01-basic.ps1                  只封 Anthropic 网段
@@ -34,7 +34,7 @@ $Group = 'Claude-KS'
 # 来源：https://platform.claude.com/docs/en/api/ip-addresses
 # 这些值可能变化，建议偶尔核对。
 # --------------------------------------------------------------------------
-$AnthropicV4 = @('160.79.104.0/23')
+$AnthropicV4 = @('160.79.104.0/23', '153.61.224.0/22')
 $AnthropicV6 = @('2607:6bc0::/48', '2607:6bc0:11::/48')
 
 # 全部 IPv6 出公网 = 全球单播 + NAT64。
@@ -117,7 +117,10 @@ function New-KSRule {
 }
 
 Write-Host ''
-New-KSRule -Name 'KS - Block Anthropic IPv4 on physical' -Remote $AnthropicV4
+# 保留已安装的旧 IPv4 规则，给新增网段单独加规则。
+# 旧版规则已存在时 New-KSRule 会跳过，因此只修改地址数组无法完成升级。
+New-KSRule -Name 'KS - Block Anthropic IPv4 on physical' -Remote @('160.79.104.0/23')
+New-KSRule -Name 'KS - Block Anthropic IPv4 153.61.224.0-22 on physical' -Remote @('153.61.224.0/22')
 New-KSRule -Name 'KS - Block Anthropic IPv6 on physical' -Remote $AnthropicV6
 if ($BlockAllIPv6) {
     New-KSRule -Name 'KS - Block all IPv6 on physical' -Remote $AllV6
@@ -137,11 +140,21 @@ foreach ($r in (Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue)
     if ($ifa -contains 'Any') { $bad += $r.DisplayName }
 }
 
+# 检查新网段确实落在启用的阻断规则里，防止已有同名错误规则被直接跳过。
+$newV4Rule = Get-NetFirewallRule -DisplayName 'KS - Block Anthropic IPv4 153.61.224.0-22 on physical' -ErrorAction SilentlyContinue
+$newV4Addresses = if ($newV4Rule) { @(($newV4Rule | Get-NetFirewallAddressFilter).RemoteAddress) } else { @() }
+if (-not $newV4Rule -or $newV4Rule.Enabled -ne 'True' -or
+    $newV4Rule.Direction -ne 'Outbound' -or $newV4Rule.Action -ne 'Block' -or
+    ($newV4Addresses -notcontains '153.61.224.0/22' -and
+     $newV4Addresses -notcontains '153.61.224.0/255.255.252.0')) {
+    $bad += '新增 IPv4 153.61.224.0/22 规则缺失或无效'
+}
+
 Write-Host ''
 if ($bad.Count -gt 0) {
-    Write-Host '  [问题] 下面这些规则的网卡限定没有生效（显示为 Any）：' -ForegroundColor Red
+    Write-Host '  [问题] 以下规则的网卡限定或地址覆盖不符合预期：' -ForegroundColor Red
     $bad | ForEach-Object { Info "    $_" }
-    Info '  这些规则会连隧道一起封掉。建议立刻跑 .\99-uninstall.ps1 撤销，然后反馈问题。'
+    Info '  请检查上面的规则详情。网卡为 Any 时会误伤隧道；地址缺失则没有形成预期拦截。'
     exit 1
 }
 
