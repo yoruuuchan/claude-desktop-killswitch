@@ -317,6 +317,8 @@ Claude Desktop 包内还有 `cowork-svc.exe`、`chrome-native-host.exe` 等；�
 | `scripts/01-basic.ps1` | 基础防护：按目的地封 Anthropic 网段 |
 | `scripts/02-full-install.ps1` | 完整防护：按进程封 + 装自动重建任务 |
 | `scripts/02-full-rebuild.ps1` | 被计划任务调用的重建脚本（只增不删） |
+| `scripts/ks-lib.ps1` | 共享判断函数库（规则健康判定、门禁、清理），被主脚本和测试引用 |
+| `tests/run-tests.ps1` | 回归测试（纯 mock，不碰真实防火墙） |
 | `scripts/03-verify.ps1` | 诱饵验证，证明规则真的会开火 |
 | `scripts/99-uninstall.ps1` | 全部撤销 |
 | `docs/verification.md` | 完整的零泄漏验证流程 |
