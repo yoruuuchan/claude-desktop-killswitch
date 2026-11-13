@@ -178,3 +178,31 @@ function Find-KSWfpBlockOrigin {
     }
     return $null
 }
+
+<#
+    Return identities holding write-ish Allow ACEs on an ACL object that are
+    not SYSTEM (S-1-5-18) or BUILTIN\Administrators (S-1-5-32-544). A non-empty
+    result means the directory is writable by non-admins — for a directory a
+    HighestAvailable scheduled task executes scripts from, that is a
+    privilege-escalation path and installation must be refused.
+#>
+function Get-KSUnsafeAclIdentities {
+    param($Acl)
+    $safeSids = @('S-1-5-18', 'S-1-5-32-544')
+    $writeRights = [int][System.Security.AccessControl.FileSystemRights]::Write -bor
+                   [int][System.Security.AccessControl.FileSystemRights]::Modify -bor
+                   [int][System.Security.AccessControl.FileSystemRights]::FullControl
+    $unsafe = @()
+    foreach ($ace in @($Acl.Access)) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        if (([int]$ace.FileSystemRights -band $writeRights) -eq 0) { continue }
+        $sid = $null
+        try {
+            $sid = $ace.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+        if ($sid -and $safeSids -contains $sid) { continue }
+        $unsafe += $ace.IdentityReference.Value
+    }
+    return @($unsafe | Sort-Object -Unique)
+}

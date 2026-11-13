@@ -189,15 +189,25 @@ foreach ($u in $userRoots) {
     }
     # b) npm 默认全局位置
     $cliCandidates.Add((Join-Path $u 'AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code'))
+    # b2) 全局 npmrc（<prefix>\etc\npmrc，默认 prefix 是 %APPDATA%\npm）里自定义的 prefix=
+    $globalNpmrc = Join-Path $u 'AppData\Roaming\npm\etc\npmrc'
+    if (Test-Path $globalNpmrc) {
+        foreach ($line in (Get-Content $globalNpmrc -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*prefix\s*=\s*(.+?)\s*$') {
+                $cliCandidates.Add((Join-Path $Matches[1] 'node_modules\@anthropic-ai\claude-code'))
+            }
+        }
+    }
     # c) 原生安装器位置
     $cliCandidates.Add((Join-Path $u '.local\bin'))
 }
-# d) npm 命令自己报告 prefix（以用户身份跑时最准；SYSTEM 下没有 npm 就跳过）
-try {
-    $npm = Get-Command npm -ErrorAction Stop
-    $prefix = (& $npm.Source prefix -g 2>$null | Select-Object -First 1)
-    if ($prefix) { $cliCandidates.Add((Join-Path $prefix 'node_modules\@anthropic-ai\claude-code')) }
-} catch { }
+# d) 机器级线索：NPM_CONFIG_PREFIX 环境变量和 nodejs 默认安装目录。
+#    只做只读发现（拼路径 + Test-Path）——绝不在高权限任务上下文里执行
+#    PATH 上找到的 npm：那等于让提权任务运行「低权限用户可替换的可执行文件」。
+if ($env:NPM_CONFIG_PREFIX) {
+    $cliCandidates.Add((Join-Path $env:NPM_CONFIG_PREFIX 'node_modules\@anthropic-ai\claude-code'))
+}
+$cliCandidates.Add((Join-Path $env:ProgramFiles 'nodejs\node_modules\@anthropic-ai\claude-code'))
 
 foreach ($pkgDir in ($cliCandidates | Sort-Object -Unique)) {
     # wrapper 包的 bin（postinstall 已把真实二进制放进来）

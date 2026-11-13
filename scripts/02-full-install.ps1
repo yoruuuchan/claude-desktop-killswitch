@@ -26,8 +26,12 @@ param([switch]$Yes)
 
 $ErrorActionPreference = 'Stop'
 
+# Shared pure-logic helpers (install-dir ACL safety check).
+. (Join-Path $PSScriptRoot 'ks-lib.ps1')
+
 $InstallDir = 'C:\ProgramData\ClaudeKillSwitch'
 $RebuildDst = Join-Path $InstallDir 'rebuild.ps1'
+$LibDst     = Join-Path $InstallDir 'ks-lib.ps1'
 $TaskName   = 'Claude KS Rebuild'
 
 function Fail($m) { Write-Host "  [失败] $m" -ForegroundColor Red; exit 1 }
@@ -46,6 +50,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 $RebuildSrc = Join-Path $PSScriptRoot '02-full-rebuild.ps1'
 if (-not (Test-Path $RebuildSrc)) { Fail "找不到 $RebuildSrc" }
+$LibSrc = Join-Path $PSScriptRoot 'ks-lib.ps1'
+if (-not (Test-Path $LibSrc)) { Fail "找不到 $LibSrc" }
 
 if (-not (Get-NetFirewallRule -Group 'Claude-KS' -ErrorAction SilentlyContinue)) {
     Warn '还没装基础防护。建议先跑 .\01-basic.ps1 —— 那一层是身份无关的，'
@@ -78,9 +84,58 @@ if (-not $Yes) {
     if ($a -notmatch '^[yY]') { Write-Host '  已取消，什么都没改。' -ForegroundColor Yellow; exit 0 }
 }
 
-# ---- 1. 安装脚本 ----
-New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+# ---- 1. 安装脚本（先校验目录，再落文件）----
+# 计划任务以 HighestAvailable 权限执行这个目录里的脚本。目录本身如果允许
+# 非管理员写入，高权限任务就等于在执行「低权限用户可以替换的代码」——
+# 这是确定的提权路径，必须先校验再安装。
+$adminSid = 'S-1-5-32-544'
+$systemSid = 'S-1-5-18'
+
+if (Test-Path $InstallDir) {
+    $dirItem = Get-Item $InstallDir -Force
+    if ($dirItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Fail "$InstallDir 是 reparse point（junction / symlink）。为避免高权限任务执行被重定向的脚本，拒绝安装。请手动检查这个位置。"
+    }
+    $unsafe = Get-KSUnsafeAclIdentities -Acl (Get-Acl $InstallDir)
+    if ($unsafe.Count -gt 0) {
+        Fail ("$InstallDir 的 ACL 允许非管理员写入：{0}。" -f ($unsafe -join '、'))
+        Info '这个目录可能已被篡改，或者带着 ProgramData 的默认宽松继承（Users 可写）。'
+        Info '手动处置：确认目录内容可信后，删除该目录，或手动把 ACL 收紧为 SYSTEM + Administrators，再重新运行本脚本。'
+    }
+} else {
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+}
+
+# 显式收紧 ACL：切断继承，只留 SYSTEM 和 Administrators 完全控制，
+# Owner 设为 Administrators，然后回读验证 —— 不信任「设过了」。
+$dirAcl = Get-Acl $InstallDir
+$dirAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier($adminSid)))
+$dirAcl.SetAccessRuleProtection($true, $false)
+$dirAcl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    (New-Object System.Security.Principal.SecurityIdentifier($systemSid)),
+    'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+$dirAcl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    (New-Object System.Security.Principal.SecurityIdentifier($adminSid)),
+    'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+Set-Acl -Path $InstallDir -AclObject $dirAcl
+
+$checkAcl = Get-Acl $InstallDir
+$checkUnsafe = Get-KSUnsafeAclIdentities -Acl $checkAcl
+if ($checkUnsafe.Count -gt 0) {
+    Fail ("收紧 ACL 后回读仍发现非管理员可写：{0}。拒绝继续安装。" -f ($checkUnsafe -join '、'))
+}
+$ownerSid = $null
+try {
+    $ownerSid = (New-Object System.Security.Principal.NTAccount($checkAcl.Owner)).Translate(
+        [System.Security.Principal.SecurityIdentifier]).Value
+} catch { }
+if ($ownerSid -ne $adminSid) {
+    Fail "目录 Owner 设置失败（当前 Owner：$($checkAcl.Owner)）。拒绝继续安装。"
+}
+Ok "目录已就绪并通过 ACL 校验：$InstallDir"
+
 Copy-Item $RebuildSrc $RebuildDst -Force
+Copy-Item $LibSrc $LibDst -Force
 Ok "脚本已安装：$RebuildDst"
 
 # ---- 2. 注册计划任务 ----
