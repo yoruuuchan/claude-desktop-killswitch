@@ -217,19 +217,20 @@ Info '触发条件：Claude 更新事件（574/855/617）、登录时、每 10 �
 Write-Host ''
 Info '正在首次生成规则，请稍候（可能要半分钟）…'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $RebuildDst | Out-Null
-$code = $LASTEXITCODE
+$rebuildCode = $LASTEXITCODE
 
 $log = Join-Path $InstallDir 'rebuild.log'
 $last = if (Test-Path $log) { (Get-Content $log -Tail 1) } else { '(没有日志)' }
 
 Write-Host ''
-if ($code -eq 0) {
+if ($rebuildCode -eq 0) {
     Ok '规则生成完成'
     Info $last
 } else {
-    Warn "重建脚本返回了非零退出码（$code），说明有目标没覆盖到。"
+    Warn "重建脚本返回了非零退出码（$rebuildCode）：有目标没覆盖到，或发现源读取失败。"
     Info $last
-    Info '注意：即使失败，它也不会删掉任何已存在的规则。'
+    Info '注意：即使失败，它也不会删掉任何已存在的规则；规则和计划任务都保留。'
+    Info '本安装器将用同样的退出码结束，方便脚本化使用。'
 }
 
 $n = @(Get-NetFirewallRule -Group 'Claude-KS-App' -ErrorAction SilentlyContinue).Count
@@ -242,3 +243,6 @@ Write-Host ''
 Info "日志：$log"
 Info '撤销：.\99-uninstall.ps1'
 Write-Host ''
+
+# Propagate the first rebuild's exit code instead of always exiting 0.
+exit (Get-KSInstallFinalExit -RebuildExitCode $rebuildCode)

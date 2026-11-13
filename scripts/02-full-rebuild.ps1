@@ -77,17 +77,34 @@ if ($phys.Count -eq 0) {
 
 $targets = [System.Collections.Generic.List[string]]::new()
 
+# 每个发现源都要记状态：ok（读到了）/ absent（确实没有）/ failed（读失败）。
+# 任何 failed = 该源的覆盖范围未知 = 不能当成功上报（fail-open 是致命的）。
+$sourceStatus = [System.Collections.Generic.List[object]]::new()
+function Add-KSSourceStatus([string]$Source, [string]$Status) {
+    $sourceStatus.Add([pscustomobject]@{ Source = $Source; Status = $Status })
+}
+
 # 所有真实用户的 profile 根（比 $env:USERPROFILE 可靠：SYSTEM 跑时它指向
 # systemprofile；比 $env:APPDATA 可靠：S4U 会话里它可能为空）
-$userRoots = @((Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+$ev = $null
+$userRoots = @((Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue -ErrorVariable ev |
     Select-Object -ExpandProperty FullName))
 $userRoots += $env:USERPROFILE
 $userRoots = @($userRoots | Sort-Object -Unique)
+Add-KSSourceStatus 'user-profiles' $(if ($ev) { 'failed' } else { 'ok' })
 
 # --- 1. Claude Desktop (MSIX)：Appx API + WindowsApps 直接扫描，两条腿走路 ---
-$pkgs = @()
-try { $pkgs = @(Get-AppxPackage -Name Claude -AllUsers -ErrorAction SilentlyContinue) } catch { }
-try { $pkgs += @(Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue) } catch { }
+$srcDesktop = 'absent'
+try {
+    $ev = $null
+    $pkgs = @(Get-AppxPackage -Name Claude -AllUsers -ErrorAction SilentlyContinue -ErrorVariable ev)
+    if ($ev) { $srcDesktop = 'failed' }
+} catch { $srcDesktop = 'failed' }
+try {
+    $ev = $null
+    $pkgs += @(Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue -ErrorVariable ev)
+    if ($ev) { $srcDesktop = 'failed' }
+} catch { $srcDesktop = 'failed' }
 $pkg  = $pkgs | Select-Object -First 1
 $installLocs = @($pkgs | Where-Object InstallLocation |
     Select-Object -ExpandProperty InstallLocation -Unique)
@@ -96,12 +113,17 @@ $installLocs = @($pkgs | Where-Object InstallLocation |
 # 不依赖包注册状态：卸载重装、注册表没跟上、跨用户上下文，都能发现。
 $winApps = Join-Path $env:ProgramFiles 'WindowsApps'
 if (Test-Path $winApps) {
-    $installLocs += @(Get-ChildItem $winApps -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue |
+    $ev = $null
+    $installLocs += @(Get-ChildItem $winApps -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue -ErrorVariable ev |
         Select-Object -ExpandProperty FullName)
+    if ($ev) { $srcDesktop = 'failed' }
 }
 foreach ($loc in ($installLocs | Sort-Object -Unique)) {
-    Get-ChildItem $loc -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
+    $ev = $null
+    Get-ChildItem $loc -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue -ErrorVariable ev |
         ForEach-Object { $targets.Add($_.FullName) }
+    if ($ev) { $srcDesktop = 'failed' }
+    elseif ($srcDesktop -ne 'failed') { $srcDesktop = 'ok' }
 }
 $pfn = if ($pkg -and $pkg.PackageFamilyName) { $pkg.PackageFamilyName } else { 'Claude_pzs8sxrjxfjjc' }
 
@@ -124,10 +146,12 @@ $fullNameRx = '{0}_[0-9][0-9.]*_(?:x86|x64|arm|arm64|neutral)__{1}' -f
 $relTemplate = @()
 if ($pkg -and $pkg.InstallLocation -and (Test-Path $pkg.InstallLocation)) {
     $base = $pkg.InstallLocation.TrimEnd('\')
+    $ev = $null
     $relTemplate = @(
-        Get-ChildItem $base -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
+        Get-ChildItem $base -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue -ErrorVariable ev |
             ForEach-Object { $_.FullName.Substring($base.Length).TrimStart('\') }
     )
+    if ($ev) { $srcDesktop = 'failed' }
 }
 if ($relTemplate.Count -eq 0) {
     # 读不到当前包时的兜底清单
@@ -138,24 +162,52 @@ if ($relTemplate.Count -eq 0) {
         'app\resources\app.asar.unpacked\resources\github-mcp\github-mcp-server.exe'
     )
 }
+Add-KSSourceStatus 'desktop-package' $srcDesktop
 
+# --- 2. 预置：从 AppX 部署日志里读出「即将安装」的包名 ---
+# Windows 在真正替换文件几小时前就会把新版本的完整包名写进日志（事件 574 / 855），
+# 而且不会在 Claude 运行时替换文件（事件 638）。所以我们可以在新程序还不存在的时候
+# 就为它建好规则 —— 防火墙接受指向不存在路径的规则。这才是消除更新竞态的办法。
+
+# MSIX 包全名的格式是   Name_Version_Architecture__PublisherId
+# 架构可能是 x86 / x64 / arm / arm64 / neutral，不能写死。
+# 从 PackageFamilyName 拆出 Name 和 PublisherId 来约束匹配（避免误伤日志里别的应用），
+# 架构那一段保持开放，并且【从日志里原样提取完整包名】，不自己拼接。
+$pkgName = $pfn -replace '_[^_]+$', ''
+$pubId   = ($pfn -split '_')[-1]
+$fullNameRx = '{0}_[0-9][0-9.]*_(?:x86|x64|arm|arm64|neutral)__{1}' -f
+              [regex]::Escape($pkgName), [regex]::Escape($pubId)
+
+$srcAppxLog = 'absent'
 try {
-    Get-WinEvent -FilterHashtable @{
+    $ev = $null
+    $appxEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'Microsoft-Windows-AppXDeploymentServer/Operational'
             StartTime = (Get-Date).AddDays(-14)
-        } -MaxEvents 2000 -ErrorAction Stop |
-        ForEach-Object { [regex]::Matches($_.Message, $fullNameRx) } |
-        ForEach-Object { $_.Value } |
-        Sort-Object -Unique |
-        ForEach-Object {
-            $pkgRoot = Join-Path (Join-Path $env:ProgramFiles 'WindowsApps') $_
-            foreach ($rel in $relTemplate) { $targets.Add((Join-Path $pkgRoot $rel)) }
-        }
+        } -MaxEvents 2000 -ErrorAction SilentlyContinue -ErrorVariable ev
+    if ($ev) {
+        # "No events were found" is a legitimate empty log (absent), not a read failure.
+        $firstErr = @($ev)[0]
+        if ($firstErr.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $srcAppxLog = 'failed' }
+    }
+    if ($appxEvents) {
+        $srcAppxLog = 'ok'
+        $appxEvents |
+            ForEach-Object { [regex]::Matches($_.Message, $fullNameRx) } |
+            ForEach-Object { $_.Value } |
+            Sort-Object -Unique |
+            ForEach-Object {
+                $pkgRoot = Join-Path (Join-Path $env:ProgramFiles 'WindowsApps') $_
+                foreach ($rel in $relTemplate) { $targets.Add((Join-Path $pkgRoot $rel)) }
+            }
+    }
 } catch {
-    Write-Log "WARN: 读不到 AppX 部署日志：$($_.Exception.Message)"
+    $srcAppxLog = 'failed'
 }
+Add-KSSourceStatus 'appx-deploy-log' $srcAppxLog
 
 # --- 3. 包目录之外的进程：扩展 / MCP（遍历所有用户 profile）---
+$srcExt = 'absent'
 foreach ($u in $userRoots) {
     @(
         (Join-Path $u 'AppData\Roaming\Claude\Claude Extensions')
@@ -163,11 +215,15 @@ foreach ($u in $userRoots) {
         (Join-Path $u 'AppData\Roaming\Claude\claude-code')
     ) | ForEach-Object {
         if (Test-Path $_) {
-            Get-ChildItem $_ -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
+            if ($srcExt -ne 'failed') { $srcExt = 'ok' }
+            $ev = $null
+            Get-ChildItem $_ -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue -ErrorVariable ev |
                 ForEach-Object { $targets.Add($_.FullName) }
+            if ($ev) { $srcExt = 'failed' }
         }
     }
 }
+Add-KSSourceStatus 'extension-dirs' $srcExt
 
 # --- 4. Claude Code CLI（npm 全局安装）---
 # npm 装的 CLI 不在 Desktop 包里，也不在扩展目录里，必须单独找。
@@ -177,13 +233,20 @@ foreach ($u in $userRoots) {
 #   · 二进制位于 <npm prefix>\node_modules\@anthropic-ai\claude-code\bin\claude.exe，
 #     以及同包嵌套的平台包 claude-code-win32-x64\claude.exe（同一文件的硬链接）。
 $cliCandidates = [System.Collections.Generic.List[string]]::new()
+$srcCli = 'absent'
 foreach ($u in $userRoots) {
     # a) 用户 .npmrc 里自定义的 prefix=（自定义安装盘的机器只有这里能查到）
     $npmrc = Join-Path $u '.npmrc'
     if (Test-Path $npmrc) {
-        foreach ($line in (Get-Content $npmrc -ErrorAction SilentlyContinue)) {
-            if ($line -match '^\s*prefix\s*=\s*(.+?)\s*$') {
-                $cliCandidates.Add((Join-Path $Matches[1] 'node_modules\@anthropic-ai\claude-code'))
+        if ($srcCli -ne 'failed') { $srcCli = 'ok' }
+        $ev = $null
+        $npmrcLines = Get-Content $npmrc -ErrorAction SilentlyContinue -ErrorVariable ev
+        if ($ev) { $srcCli = 'failed' }
+        elseif ($npmrcLines) {
+            foreach ($line in $npmrcLines) {
+                if ($line -match '^\s*prefix\s*=\s*(.+?)\s*$') {
+                    $cliCandidates.Add((Join-Path $Matches[1] 'node_modules\@anthropic-ai\claude-code'))
+                }
             }
         }
     }
@@ -192,9 +255,15 @@ foreach ($u in $userRoots) {
     # b2) 全局 npmrc（<prefix>\etc\npmrc，默认 prefix 是 %APPDATA%\npm）里自定义的 prefix=
     $globalNpmrc = Join-Path $u 'AppData\Roaming\npm\etc\npmrc'
     if (Test-Path $globalNpmrc) {
-        foreach ($line in (Get-Content $globalNpmrc -ErrorAction SilentlyContinue)) {
-            if ($line -match '^\s*prefix\s*=\s*(.+?)\s*$') {
-                $cliCandidates.Add((Join-Path $Matches[1] 'node_modules\@anthropic-ai\claude-code'))
+        if ($srcCli -ne 'failed') { $srcCli = 'ok' }
+        $ev = $null
+        $globalNpmrcLines = Get-Content $globalNpmrc -ErrorAction SilentlyContinue -ErrorVariable ev
+        if ($ev) { $srcCli = 'failed' }
+        elseif ($globalNpmrcLines) {
+            foreach ($line in $globalNpmrcLines) {
+                if ($line -match '^\s*prefix\s*=\s*(.+?)\s*$') {
+                    $cliCandidates.Add((Join-Path $Matches[1] 'node_modules\@anthropic-ai\claude-code'))
+                }
             }
         }
     }
@@ -212,28 +281,45 @@ $cliCandidates.Add((Join-Path $env:ProgramFiles 'nodejs\node_modules\@anthropic-
 foreach ($pkgDir in ($cliCandidates | Sort-Object -Unique)) {
     # wrapper 包的 bin（postinstall 已把真实二进制放进来）
     $bin = Join-Path $pkgDir 'bin\claude.exe'
-    if (Test-Path $bin) { $targets.Add($bin) }
+    if (Test-Path $bin) {
+        $targets.Add($bin)
+        if ($srcCli -ne 'failed') { $srcCli = 'ok' }
+    }
     # 嵌套的平台包（install.cjs 的复制来源，硬链接同源）
     $scoped = Join-Path $pkgDir 'node_modules\@anthropic-ai'
     if (Test-Path $scoped) {
-        Get-ChildItem $scoped -Directory -Filter 'claude-code-*' -ErrorAction SilentlyContinue |
+        $ev = $null
+        Get-ChildItem $scoped -Directory -Filter 'claude-code-*' -ErrorAction SilentlyContinue -ErrorVariable ev |
             ForEach-Object {
                 $plat = Join-Path $_.FullName 'claude.exe'
-                if (Test-Path $plat) { $targets.Add($plat) }
+                if (Test-Path $plat) {
+                    $targets.Add($plat)
+                    if ($srcCli -ne 'failed') { $srcCli = 'ok' }
+                }
             }
+        if ($ev) { $srcCli = 'failed' }
     }
-    # c) 原生安装器的独立可执行文件
+    # e) 原生安装器的独立可执行文件
     if ($pkgDir -notmatch '@anthropic-ai') {
         $native = Join-Path $pkgDir 'claude.exe'
-        if (Test-Path $native) { $targets.Add($native) }
+        if (Test-Path $native) {
+            $targets.Add($native)
+            if ($srcCli -ne 'failed') { $srcCli = 'ok' }
+        }
     }
 }
+Add-KSSourceStatus 'claude-code-cli' $srcCli
 
 $wanted = @($targets | Sort-Object -Unique)
-if ($wanted.Count -eq 0) {
-    Write-Log 'ABORT: 一个目标都没发现，未做任何改动。'
+# 「零目标」或「任何发现源读取失败」都不许继续：覆盖范围未知的“成功”是假成功。
+# 已存在的规则保持不动（只增不删），本次不做任何改动。
+$discoveryVerdict = Get-KSDiscoveryVerdict -SourceStatuses $sourceStatus -TargetCount $wanted.Count
+if ($discoveryVerdict.Abort) {
+    Write-Log ("ABORT: $($discoveryVerdict.Reason)，未做任何改动。来源状态：" +
+        (($sourceStatus | ForEach-Object { "{0}={1}" -f $_.Source, $_.Status }) -join ' '))
     exit 1
 }
+Write-Log ("SOURCES: " + (($sourceStatus | ForEach-Object { "{0}={1}" -f $_.Source, $_.Status }) -join ' '))
 
 # ====================================================== 创建（只增不删）====
 # 同名 ≠ 有效：已存在的规则要做健康检查（启用 / 出站 / Block / Profile Any /

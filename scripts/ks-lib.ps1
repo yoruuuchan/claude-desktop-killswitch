@@ -206,3 +206,78 @@ function Get-KSUnsafeAclIdentities {
     }
     return @($unsafe | Sort-Object -Unique)
 }
+
+<#
+    Decide whether the rebuild may proceed after target discovery.
+    Abort when any discovery source failed to read (its coverage is unknown,
+    so a green "all covered" would be a lie) or when zero targets were found.
+    Existing rules are never touched on abort.
+    Returns @{ Abort; Reason }.
+#>
+function Get-KSDiscoveryVerdict {
+    param($SourceStatuses, [int]$TargetCount)
+    $failed = @($SourceStatuses | Where-Object { $_.Status -eq 'failed' })
+    if ($failed.Count -gt 0) {
+        return @{ Abort = $true
+                  Reason = ('发现源读取失败：' + (($failed | ForEach-Object { $_.Source }) -join '、') + '，覆盖范围未知') }
+    }
+    if ($TargetCount -eq 0) {
+        return @{ Abort = $true; Reason = '一个目标都没发现' }
+    }
+    return @{ Abort = $false; Reason = '' }
+}
+
+<#
+    Exit code for 03-verify.ps1: 0 = all verified, 1 = something failed,
+    2 = something could not be verified (incomplete conclusion, NOT a pass).
+#>
+function Get-KSVerifyExitCode {
+    param([string[]]$Pass, [string[]]$Fail, [string[]]$Skip)
+    if (@($Fail).Count -gt 0) { return 1 }
+    if (@($Skip).Count -gt 0) { return 2 }
+    if (@($Pass).Count -gt 0) { return 0 }
+    return 2
+}
+
+<#
+    Conclusion lines for 03-verify.ps1, split into four honest categories:
+    installed / config-check passed / live-test passed / not verified.
+    The decoy tests only cover IPv4+TCP; IPv6 and UDP/QUIC are called out
+    explicitly so a pass is never over-read.
+#>
+function Get-KSVerifyConclusion {
+    param([string[]]$Pass, [string[]]$Fail, [string[]]$Skip, [bool]$BasicInstalled, [bool]$AppInstalled)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add(('已安装：基础防护(Claude-KS)={0}；完整防护(Claude-KS-App)={1}' -f `
+        $(if ($BasicInstalled) { '是' } else { '否' }), $(if ($AppInstalled) { '是' } else { '否' })))
+    $mechanism = @($Pass | Where-Object { $_ -in '按目的地封', '按程序封' })
+    if ($mechanism.Count -eq 2) {
+        $lines.Add('配置检查通过：两种规则机制（按目的地、按程序）都已证明会开火')
+    } elseif ($mechanism.Count -gt 0) {
+        $lines.Add(('配置检查部分通过：{0}（另一种机制未通过或未验证）' -f ($mechanism -join '、')))
+    } else {
+        $lines.Add('配置检查：没有成功项（机制未通过或未验证）')
+    }
+    if (@($Pass) -contains 'Anthropic 规则') {
+        $lines.Add('实测通过：Anthropic 正式规则已在物理网卡上实际拦截（有 WFP 归因证据）')
+    } else {
+        $lines.Add('实测通过：无（-TestAnthropic 未跑、被跳过或未通过）')
+    }
+    if (@($Skip).Count -gt 0) {
+        $lines.Add(('未验证：{0}' -f (@($Skip) -join '、')))
+    } else {
+        $lines.Add('未验证：无')
+    }
+    $lines.Add('未实测范围：IPv6 与 UDP/QUIC —— 诱饵测试只覆盖 IPv4+TCP，这两条路径是否被挡住，本脚本没有证据。')
+    return $lines
+}
+
+<#
+    Final exit code for 02-full-install.ps1: propagate the first rebuild's
+    exit code instead of always exiting 0, so scripted installs can detect
+    partial coverage. Rules and the scheduled task are kept either way.
+#>
+function Get-KSInstallFinalExit {
+    param([int]$RebuildExitCode)
+    return $RebuildExitCode
+}

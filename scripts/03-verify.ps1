@@ -307,24 +307,32 @@ if ($pass.Count -gt 0) { Write-Host "  通过：    $($pass -join '、')" -Foreg
 if ($skip.Count -gt 0) { Write-Host "  无法验证：$($skip -join '、')" -ForegroundColor Yellow }
 if ($fail.Count -gt 0) { Write-Host "  没通过：  $($fail -join '、')" -ForegroundColor Red }
 
+# 结论分四类如实展示：已安装 / 配置检查通过 / 实测通过 / 未验证。
+# 「已安装」只说明规则存在；机制会不会开火看配置检查；正式规则是否真的
+# 拦住了 Anthropic 看「实测通过」；没测到的一律留在「未验证」，不装作通过。
+$ksBasicInstalled = [bool](Get-NetFirewallRule -Group 'Claude-KS' -ErrorAction SilentlyContinue)
+$ksAppInstalled   = [bool](Get-NetFirewallRule -Group 'Claude-KS-App' -ErrorAction SilentlyContinue)
+Write-Host ''
+Write-Host '  结论分类：' -ForegroundColor White
+Get-KSVerifyConclusion -Pass $pass -Fail $fail -Skip $skip `
+    -BasicInstalled $ksBasicInstalled -AppInstalled $ksAppInstalled |
+    ForEach-Object { Info "  $_" }
+
 Write-Host ''
 if ($fail.Count -gt 0) {
     Info '在弄清楚原因之前，请【不要】认为自己已经受保护。'
-    $code = 1
 } elseif ($skip.Count -gt 0) {
     Info '通过的部分是可信的，但有项目【没能验证】—— 那不等于它是好的，只是没测出来。'
     Info '按上面的提示换个诱饵地址重跑，把它变成明确的结论。'
-    $code = 2
 } elseif ($pass.Count -gt 0) {
     Info '本方案依赖的两种规则写法在你这台机器上都确实会开火。你装的规则不是摆设。'
     Write-Host ''
     Info '想做最后的端到端验证（真的把代理弄没，看 Claude 会不会漏），'
     Info '见 docs/verification.md —— 那里有一套不会产生真实泄漏的做法。'
-    $code = 0
 } else {
     Info '一项都没跑起来。'
-    $code = 2
 }
+$code = Get-KSVerifyExitCode -Pass $pass -Fail $fail -Skip $skip
 Write-Host ('─' * 70) -ForegroundColor DarkGray
 Write-Host ''
 # 退出码：0 = 全部验证通过；1 = 有项目验证失败；2 = 有项目无法验证（结论不完整）
