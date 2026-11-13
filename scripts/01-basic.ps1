@@ -29,6 +29,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $Group = 'Claude-KS'
 
+# Shared pure-logic helpers (rule health check, create/skip/repair). Tests
+# dot-source the same file, so it must stay free of side effects on load.
+. (Join-Path $PSScriptRoot 'ks-lib.ps1')
+
 # --------------------------------------------------------------------------
 # Anthropic inbound IP ranges from the official documentation.
 # The extra IPv6 prefix (2607:6bc0:11::/48) is also originated by AS399358.
@@ -104,17 +108,20 @@ if (-not $Yes) {
     if ($a -notmatch '^[yY]') { Write-Host '  已取消，什么都没改。' -ForegroundColor Yellow; exit 0 }
 }
 
-# ---- 创建（幂等） ----
+# ---- 创建（幂等；同名但不健康的规则会被原地修复）----
+# 「同名 ≠ 有效」：已存在的规则要做健康检查（启用 / 出站 / Block / Profile Any /
+# 地址覆盖 / 网卡覆盖当前全部物理网卡）。健康的跳过；不健康的用 Set-NetFirewallRule
+# 原地修复（不删旧规则，任何时刻都没有裸奔窗口）；缺失的才新建。
 function New-KSRule {
     param([string]$Name, [string[]]$Remote)
 
-    $exist = Get-NetFirewallRule -DisplayName $Name -ErrorAction SilentlyContinue
-    if ($exist) { Info "已存在，跳过：$Name"; return }
-
-    New-NetFirewallRule -DisplayName $Name -Group $Group `
-        -Direction Outbound -Action Block -Profile Any `
-        -RemoteAddress $Remote -InterfaceAlias $phys | Out-Null
-    Ok "已创建：$Name"
+    $existing = @(Get-NetFirewallRule -DisplayName $Name -ErrorAction SilentlyContinue)
+    $result = Update-KSBlockRule -Name $Name -Group $Group -RemoteAddress $Remote -InterfaceAlias $phys -ExistingRules $existing
+    switch ($result.Action) {
+        'created'  { Ok "已创建：$Name" }
+        'repaired' { Ok "已修复：$Name（同名规则存在但不健康，已原地修复）" }
+        'skipped'  { Info "已存在且健康，跳过：$Name" }
+    }
 }
 
 Write-Host ''
@@ -127,39 +134,52 @@ if ($BlockAllIPv6) {
     New-KSRule -Name 'KS - Block all IPv6 on physical' -Remote $AllV6
 }
 
-# ---- 验证规则真的带上了网卡限定 ----
-# 这一步很重要：如果 -InterfaceAlias 没写进去，规则会变成对所有网卡生效，
-# 那就会把隧道也一起封掉（表现是 Claude 立刻用不了 —— 很吵，但至少不会静默泄漏）。
+# ---- 验证：每条规则都要真的健康（同名 ≠ 有效）----
+# 只排除「网卡为 Any」或只核对新增 IPv4 那一条是不够的：规则被禁用、地址被改、
+# 新增物理网卡（USB 网卡 / 扩展坞）后旧规则不再覆盖新网卡 —— 这三种情况下
+# 脚本仍然必须报失败，不能报 OK。对安全工具来说 fail-open 是致命的。
 Write-Host ''
+$expectedSpecs = @(
+    @{ Name = 'KS - Block Anthropic IPv4 on physical';                 Remote = @('160.79.104.0/23') }
+    @{ Name = 'KS - Block Anthropic IPv4 153.61.224.0-22 on physical'; Remote = @('153.61.224.0/22') }
+    @{ Name = 'KS - Block Anthropic IPv6 on physical';                 Remote = $AnthropicV6 }
+)
+if ($BlockAllIPv6) {
+    $expectedSpecs += @{ Name = 'KS - Block all IPv6 on physical'; Remote = $AllV6 }
+}
+
 $bad = @()
-foreach ($r in (Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue)) {
+$allKs = @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue)
+foreach ($r in $allKs) {
     $ifa = @(($r | Get-NetFirewallInterfaceFilter).InterfaceAlias)
     $adr = @(($r | Get-NetFirewallAddressFilter).RemoteAddress)
     Write-Host ("  {0}" -f $r.DisplayName) -ForegroundColor White
     Info   ("    网卡：{0}" -f ($ifa -join '、'))
     Info   ("    目标：{0}" -f ($adr -join '  '))
-    if ($ifa -contains 'Any') { $bad += $r.DisplayName }
 }
-
-# Verify the new range is covered by an enabled block rule, even if its name already existed.
-$newV4Rule = Get-NetFirewallRule -DisplayName 'KS - Block Anthropic IPv4 153.61.224.0-22 on physical' -ErrorAction SilentlyContinue
-$newV4Addresses = if ($newV4Rule) { @(($newV4Rule | Get-NetFirewallAddressFilter).RemoteAddress) } else { @() }
-if (-not $newV4Rule -or $newV4Rule.Enabled -ne 'True' -or
-    $newV4Rule.Direction -ne 'Outbound' -or $newV4Rule.Action -ne 'Block' -or
-    ($newV4Addresses -notcontains '153.61.224.0/22' -and
-     $newV4Addresses -notcontains '153.61.224.0/255.255.252.0')) {
-    $bad += '新增 IPv4 153.61.224.0/22 规则缺失或无效'
+foreach ($spec in $expectedSpecs) {
+    $rule = @($allKs | Where-Object { $_.DisplayName -eq $spec.Name })
+    if ($rule.Count -eq 0) {
+        $bad += "$($spec.Name) 缺失"
+        continue
+    }
+    $unhealthy = @($rule | Where-Object {
+        -not (Test-KSRuleHealth -Rule $_ -ExpectedRemoteAddress $spec.Remote -ExpectedInterfaceAlias $phys) })
+    if ($unhealthy.Count -gt 0) {
+        $bad += "$($spec.Name) 不健康（被禁用 / 地址被改 / 网卡未覆盖当前全部物理网卡）"
+    }
 }
 
 Write-Host ''
 if ($bad.Count -gt 0) {
-    Write-Host '  [问题] 以下规则的网卡限定或地址覆盖不符合预期：' -ForegroundColor Red
+    Write-Host '  [问题] 以下规则不符合健康标准：' -ForegroundColor Red
     $bad | ForEach-Object { Info "    $_" }
-    Info '  请检查上面的规则详情。网卡为 Any 时会误伤隧道；地址缺失则没有形成预期拦截。'
+    Info '  规则被禁用、地址被改、或没有覆盖当前全部物理网卡时，防护是失效的。'
+    Info '  重新运行本脚本会原地修复这些规则。'
     exit 1
 }
 
-Ok '装好了。网卡限定已确认写入。'
+Ok '装好了。所有规则都通过了健康检查（启用 / 出站 / Block / 地址覆盖 / 网卡覆盖）。'
 Write-Host ''
 Info '下一步（不要跳过）：'
 Write-Host '    .\03-verify.ps1' -ForegroundColor Green

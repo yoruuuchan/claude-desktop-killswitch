@@ -155,6 +155,18 @@ Info '本脚本【不会】去实际连接这些地址 —— 那本身就是一
 # ------------------------------------------------------- 现有规则 ----
 Section '5. 现有的防火墙规则'
 
+# 规则生效的前提是防火墙本身开着。任何一个 profile 关了，所有规则都是摆设。
+try {
+    foreach ($p in @(Get-NetFirewallProfile -ErrorAction Stop)) {
+        if ($p.Enabled -ne $true) {
+            Bad "防火墙 profile「$($p.Name)」未开启 —— 所有防火墙规则都不会生效。"
+            $findings.Add('FW_PROFILE_OFF')
+        }
+    }
+} catch {
+    Info '无法读取防火墙 profile 状态，跳过这项检查。'
+}
+
 $ksRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Group -like 'Claude-KS*' })
 if ($ksRules.Count -gt 0) {
     Ok "本项目的规则已安装：共 $($ksRules.Count) 条"
@@ -178,6 +190,40 @@ if ($ksRules.Count -gt 0) {
         } else {
             Bad "IPv4 网段缺少有效阻断：$($item.CIDR)"
             $findings.Add('V4_MISSING')
+        }
+    }
+
+    # 持久存储里有、但生效存储（ActiveStore）里没有的规则 = 现在没有生效
+    # （被禁用，或被组策略压掉）。只看本地存储会把这些规则误报为「已安装」。
+    $activeOk = $false
+    $activeNames = @()
+    try {
+        $activeNames = @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction Stop |
+            Where-Object { $_.Group -like 'Claude-KS*' } | Select-Object -ExpandProperty Name)
+        $activeOk = $true
+    } catch { }
+    if (-not $activeOk) {
+        Info '无法读取 ActiveStore（可能需要管理员权限），跳过生效性对照。'
+    } else {
+        foreach ($rule in $ksRules) {
+            if ($activeNames -notcontains $rule.Name) {
+                Bad "规则「$($rule.DisplayName)」在持久存储里，但不在生效存储（ActiveStore）中 —— 它现在没有生效。"
+                $findings.Add('NOT_ACTIVE')
+            }
+        }
+    }
+
+    # 规则绑定的网卡必须覆盖当前全部物理网卡。新插的 USB 网卡 / 扩展坞不会
+    # 被旧规则自动覆盖 —— 那是一个没人提醒的防护缺口。
+    # 指向已不存在路径的旧规则除外（只增不删留下的，本来就无害，见下面的脱靶检测）。
+    foreach ($rule in $ksRules) {
+        $prog = ($rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program
+        if ($prog -and $prog -ne 'Any' -and -not (Test-Path $prog)) { continue }
+        $ifa = @(($rule | Get-NetFirewallInterfaceFilter -ErrorAction SilentlyContinue).InterfaceAlias)
+        $missingIf = @($phys.Name | Where-Object { $ifa -notcontains $_ })
+        if ($missingIf.Count -gt 0) {
+            Warn "规则「$($rule.DisplayName)」没有覆盖当前全部物理网卡（缺：$($missingIf -join '、')）"
+            $findings.Add('IFACE_GAP')
         }
     }
 } else {
@@ -227,6 +273,18 @@ Section '结论'
 
 if ($findings -contains 'V4_MISSING') {
     Bad '当前 IPv4 防护不完整。更新仓库脚本后重新运行 .\01-basic.ps1，补齐缺失网段。'
+}
+
+if ($findings -contains 'FW_PROFILE_OFF') {
+    Bad 'Windows 防火墙本身没有全开。先把防火墙打开，任何规则才有意义。'
+}
+
+if ($findings -contains 'NOT_ACTIVE') {
+    Bad '有规则在持久存储里但不在生效存储里（被禁用或被组策略压掉）。重新运行 .\01-basic.ps1 会原地修复。'
+}
+
+if ($findings -contains 'IFACE_GAP') {
+    Bad '有规则没有覆盖当前全部物理网卡（新网卡 / 扩展坞？）。重新运行 .\01-basic.ps1 重新绑定。'
 }
 
 if ($findings -contains 'NO_PHYSICAL') {

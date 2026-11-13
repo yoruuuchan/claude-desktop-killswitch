@@ -34,6 +34,10 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Shared pure-logic helpers (rule health check, create/skip/repair).
+# 02-full-install.ps1 copies this file's sibling ks-lib.ps1 next to rebuild.ps1.
+. (Join-Path $PSScriptRoot 'ks-lib.ps1')
+
 $Group   = 'Claude-KS-App'
 $LogDir  = 'C:\ProgramData\ClaudeKillSwitch'
 $LogFile = Join-Path $LogDir 'rebuild.log'
@@ -221,61 +225,61 @@ if ($wanted.Count -eq 0) {
     exit 1
 }
 
-# ====================================================== 创建（只增不删） ====
+# ====================================================== 创建（只增不删）====
+# 同名 ≠ 有效：已存在的规则要做健康检查（启用 / 出站 / Block / Profile Any /
+# 地址覆盖 / 程序路径精确一致 / 网卡覆盖当前全部物理网卡）。健康的跳过；
+# 不健康的用 Set-NetFirewallRule 原地修复 —— 不删除任何东西，没有裸奔窗口；
+# 缺失的才新建。
 
-$have = [System.Collections.Generic.HashSet[string]]::new(
-    [System.StringComparer]::OrdinalIgnoreCase)
-Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue |
-    ForEach-Object { [void]$have.Add($_.DisplayName) }
-
+$allRules = @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue)
 $added = 0
+$repaired = 0
 foreach ($exe in $wanted) {
     foreach ($fam in @(
             @{ Tag = 'v4'; Addr = $Public4 },
             @{ Tag = 'v6'; Addr = $Public6 })) {
 
         $name = "Claude KS App $($fam.Tag) - $exe"
-        if ($have.Contains($name)) { continue }
         try {
-            New-NetFirewallRule -DisplayName $name -Group $Group `
-                -Direction Outbound -Action Block -Profile Any `
-                -Program $exe -RemoteAddress $fam.Addr -InterfaceAlias $phys | Out-Null
-            $added++
+            $result = Update-KSBlockRule -Name $name -Group $Group `
+                -RemoteAddress $fam.Addr -InterfaceAlias $phys -Program $exe `
+                -ExistingRules $allRules
+            switch ($result.Action) {
+                'created'  { $added++ }
+                'repaired' { $repaired++ }
+            }
         } catch {
-            Write-Log "ERROR 建规则失败 ${name}: $($_.Exception.Message)"
+            Write-Log "ERROR 处理规则失败 ${name}: $($_.Exception.Message)"
         }
     }
 }
 
 # ============================================================== 验证 ====
-# 一条规则只有同时满足「有程序路径」且「带了网卡限定」才算数。
-# 如果 InterfaceAlias 变成了 Any，说明出了问题（那样会连隧道一起封），
-# 不能当成功上报。
+# 一条规则要同时满足：启用、出站、Block、Profile Any、程序路径精确一致、
+# 地址集合覆盖期望值、网卡覆盖当前全部物理网卡。任何一项不满足都算未覆盖，
+# 不能当成功上报 —— 对安全工具来说，fail-open 比失败本身更危险。
 
-$covered = [System.Collections.Generic.HashSet[string]]::new(
-    [System.StringComparer]::OrdinalIgnoreCase)
 $rules = @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue)
-foreach ($r in $rules) {
-    $p = ($r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program
-    $i = @(($r | Get-NetFirewallInterfaceFilter -ErrorAction SilentlyContinue).InterfaceAlias)
-    if ($p -and $i -notcontains 'Any') {
-        [void]$covered.Add("$($r.DisplayName)")
-    }
-}
-
 $missing = @()
 foreach ($exe in $wanted) {
-    foreach ($tag in 'v4', 'v6') {
-        if (-not $covered.Contains("Claude KS App $tag - $exe")) { $missing += "$tag $exe" }
+    foreach ($fam in @(
+            @{ Tag = 'v4'; Addr = $Public4 },
+            @{ Tag = 'v6'; Addr = $Public6 })) {
+        $name = "Claude KS App $($fam.Tag) - $exe"
+        $rule = @($rules | Where-Object { $_.DisplayName -eq $name })
+        $healthy = @($rule | Where-Object {
+            Test-KSRuleHealth -Rule $_ -ExpectedRemoteAddress $fam.Addr `
+                              -ExpectedProgram $exe -ExpectedInterfaceAlias $phys })
+        if ($healthy.Count -eq 0) { $missing += "$($fam.Tag) $exe" }
     }
 }
 
 if ($missing.Count -gt 0) {
-    Write-Log ("FAIL: 新增 $added 条，共 $($rules.Count) 条，$($missing.Count) 个目标未覆盖 -> " +
+    Write-Log ("FAIL: 新增 $added 条，修复 $repaired 条，共 $($rules.Count) 条，$($missing.Count) 个目标未覆盖 -> " +
                ($missing -join ' | '))
     exit 1
 }
 
-Write-Log ("OK: 新增 $added 条，共 $($rules.Count) 条规则，覆盖 $($wanted.Count) 个程序，" +
+Write-Log ("OK: 新增 $added 条，修复 $repaired 条，共 $($rules.Count) 条规则，覆盖 $($wanted.Count) 个程序，" +
            "网卡=$($phys -join ',')")
 exit 0
