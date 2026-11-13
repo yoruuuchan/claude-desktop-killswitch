@@ -40,10 +40,15 @@ param(
     [int]$DecoyPort = 443,
 
     # 额外做一次直接针对 Anthropic 规则的验证。
-    # 它会把 Anthropic 的一个地址强制走物理网卡，然后尝试连接 —— 预期被你的规则挡住。
+    # 它会把 Anthropic 的一个地址强制走物理网卡，然后尝试连接 —— 预期被你的正式规则挡住。
+    # ⚠ 这条 /32 主机路由影响的是【整机所有进程】，不只是本脚本的探针：路由存在期间，
+    #    任何程序访问这个地址都会被压到物理网卡上。所以进入这一步之前必须完全退出
+    #    所有 Claude 相关进程（Desktop、Claude Code CLI、扩展进程）—— 否则 Claude 的
+    #    后台重试也会走这条路由，「最多一次裸 TCP」的承诺就不成立（脚本会检测并拒绝执行）。
     # 残余风险：万一规则失效，会产生一次【裸 TCP 握手】。没有 TLS、没有域名、
     # 没有任何账号信息，Anthropic 只会看到一个 IP 连上来又立刻断开。
-    # 建议先跑完前面的诱饵测试（证明机制可用）再考虑加这个。
+    # 结论规则：目标不通时必须有归因证据（WFP 5157 的 FilterOrigin 指向本项目规则）
+    #    才算「被你的正式规则挡住」；拿不到证据就报「无法证明」，不算通过。
     [switch]$TestAnthropic,
 
     [string]$AnthropicIP = '160.79.104.10'
@@ -51,6 +56,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $TestGroup = 'Claude-KS-VERIFY'
+
+# Shared pure-logic helpers (-TestAnthropic gate, WFP attribution).
+. (Join-Path $PSScriptRoot 'ks-lib.ps1')
 
 function Ok($m)   { Write-Host "  [通过] $m" -ForegroundColor Green }
 function Bad($m)  { Write-Host "  [失败] $m" -ForegroundColor Red }
@@ -229,8 +237,16 @@ try {
     if ($TestAnthropic) {
         Step "第 4 步（可选）：直接验证 Anthropic 规则"
 
-        if (-not (Get-NetFirewallRule -Group 'Claude-KS' -ErrorAction SilentlyContinue)) {
-            Warn '还没装基础防护（Claude-KS），跳过这一项。'
+        # 门禁：前序失败不测；没装基础防护不测（那只会制造一次真实直连）；
+        # Claude 相关进程还活着不测（主机路由影响整机，Claude 的后台重试会一起走）。
+        $claudeProcs = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -match '^claude' } |
+            Select-Object -ExpandProperty ProcessName -Unique)
+        $hasKS = [bool](Get-NetFirewallRule -Group 'Claude-KS' -ErrorAction SilentlyContinue)
+        $gate = Get-KSAnthropicGateDecision -FailedCount $fail.Count -HasClaudeKS $hasKS -ClaudeProcessNames $claudeProcs
+        if (-not $gate.Run) {
+            if ($gate.Category -eq 'refuse') { Bad $gate.Reason } else { Warn $gate.Reason }
+            $skip += $gate.SkipItem
         } else {
             Info "把 $AnthropicIP 强制走物理网卡，去撞你的正式规则。"
             Info "如果规则有效 → 连不上。这一步不产生任何 TLS 握手或域名信息。"
@@ -240,13 +256,30 @@ try {
             $routesAdded += "$AnthropicIP/32"
             Start-Sleep -Milliseconds 500
 
-            if (-not (Test-Tcp $AnthropicIP 443)) {
-                Ok "Anthropic 地址被你的正式规则挡住了"
-                $pass += 'Anthropic 规则'
-            } else {
+            if (Test-Tcp $AnthropicIP 443) {
                 Bad "没挡住 —— 刚才产生了一次到 Anthropic 的 TCP 握手（无 TLS、无域名）"
                 Info "请立刻检查基础防护的规则，或者跑 .\99-uninstall.ps1 后重装。"
                 $fail += 'Anthropic 规则'
+            } else {
+                # 连不上 ≠ 被你的规则挡住：目标自身不可达、别的规则拦截，都表现为不通。
+                # 只有 WFP 5157 的 FilterOrigin 指向本项目的规则，归因才算成立。
+                $originId = Find-KSWfpBlockOrigin -DestinationIP $AnthropicIP -Since (Get-Date).AddSeconds(-90)
+                if ($originId) {
+                    $originRule = Get-NetFirewallRule -Name $originId -ErrorAction SilentlyContinue
+                    if ($originRule -and $originRule.Group -like 'Claude-KS*') {
+                        Ok "Anthropic 地址被挡住，WFP 5157 归因：规则「$($originRule.DisplayName)」"
+                        $pass += 'Anthropic 规则'
+                    } else {
+                        Warn "被挡住了，但 WFP 归因显示拦截来源不是本项目的规则（FilterOrigin=$originId）。"
+                        Info "可能是别的规则（临时墙、第三方软件）拦的 —— 这不能证明你的正式规则有效。"
+                        $skip += 'Anthropic 规则（拦截来源非本项目规则）'
+                    }
+                } else {
+                    Warn "目标连不上，但拿不到归因证据（WFP 5157 审计未开启或无记录）。"
+                    Info "结论只能是【无法证明】—— 不通的原因也可能是目标自身不可达，不能当成「被你的正式规则挡住了」。"
+                    Info "想拿到归因证据：按 docs/verification.md 开启 WFP 5157 审计后重跑。"
+                    $skip += 'Anthropic 规则（无归因证据）'
+                }
             }
         }
     }

@@ -119,3 +119,62 @@ function Update-KSBlockRule {
     New-NetFirewallRule @newParams | Out-Null
     return @{ Action = 'created' }
 }
+
+<#
+    Gate for 03-verify.ps1 -TestAnthropic. The step must be skipped when
+    earlier tests already failed, when the Claude-KS rules are not installed
+    (proceeding would just create a real direct connection), and refused when
+    any Claude-related process is still alive (the /32 host route affects
+    every process on the machine, not just the probe).
+
+    Returns @{ Run; Category = 'run' | 'skip' | 'refuse'; Reason; SkipItem }.
+#>
+function Get-KSAnthropicGateDecision {
+    param([int]$FailedCount, [bool]$HasClaudeKS, [string[]]$ClaudeProcessNames)
+    if ($FailedCount -gt 0) {
+        return @{ Run = $false; Category = 'skip'
+                  Reason = '前面的测试有失败项，-TestAnthropic 已跳过：先弄清失败原因，再测正式规则。'
+                  SkipItem = 'Anthropic 规则（前序测试失败）' }
+    }
+    if (-not $HasClaudeKS) {
+        return @{ Run = $false; Category = 'skip'
+                  Reason = '还没装基础防护（Claude-KS），这一项无法验证 —— 直接测只会产生一次真实直连。'
+                  SkipItem = 'Anthropic 规则（未安装基础防护）' }
+    }
+    if (@($ClaudeProcessNames).Count -gt 0) {
+        return @{ Run = $false; Category = 'refuse'
+                  Reason = ("检测到 Claude 相关进程还在运行：{0}。这条 /32 主机路由影响整机所有进程，" -f ($ClaudeProcessNames -join '、')) +
+                           '请先完全退出所有 Claude 相关进程（含托盘和 CLI），再跑这一步。'
+                  SkipItem = 'Anthropic 规则（Claude 进程未退出）' }
+    }
+    return @{ Run = $true; Category = 'run'; Reason = ''; SkipItem = '' }
+}
+
+<#
+    Look for a WFP 5157 (blocked connection) audit event matching the probe
+    destination and return its FilterOrigin (the firewall rule ID that did
+    the blocking). Language-neutral: reads the event XML data fields, not the
+    localized message. Returns $null when auditing is off, the Security log
+    is unreadable, or the matching event carries no FilterOrigin — callers
+    must treat that as "cannot prove", never as "blocked by our rule".
+#>
+function Find-KSWfpBlockOrigin {
+    param([string]$DestinationIP, [datetime]$Since)
+    try {
+        $events = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 5157; StartTime = $Since } `
+            -MaxEvents 200 -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    foreach ($e in $events) {
+        try { $xmlDoc = [xml]$e.ToXml() } catch { continue }
+        $ns = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
+        $ns.AddNamespace('e', 'http://schemas.microsoft.com/win/2004/08/events/event')
+        $dest = $xmlDoc.SelectSingleNode('//e:EventData/e:Data[@Name="DestAddress"]', $ns)
+        if (-not $dest -or $dest.'#text' -ne $DestinationIP) { continue }
+        $origin = $xmlDoc.SelectSingleNode('//e:EventData/e:Data[@Name="FilterOrigin"]', $ns)
+        if ($origin) { return $origin.'#text' }
+        return $null
+    }
+    return $null
+}

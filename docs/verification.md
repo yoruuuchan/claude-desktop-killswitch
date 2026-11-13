@@ -194,6 +194,9 @@ Test-NetConnection <你的节点IP> -Port <节点端口> | Select-Object TcpTest
 三样都要弄掉：
 
 ```powershell
+# 先保存当前值 —— 第 7 步恢复时恢复的是【测试前的原值】，不是无脑写回 1
+$ksProxyBefore = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings').ProxyEnable
+
 # 关系统代理
 Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -Name ProxyEnable -Value 0
 
@@ -212,6 +215,9 @@ Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object ifIndex,NextHop
 
 如果 Claude 明确说「被防火墙挡住」（而不是超时），那是更好的结果 ——
 说明它确实发起了直连尝试，并且在 connect 那一刻被策略拒绝了。
+
+测完先不要直接跳到第 7 步：恢复的第一步是**完全退出 Claude**（见下），
+顺序错了会在「正式规则恰好失效 + Claude 还在后台重试」的窗口里制造一次真实直连。
 
 **6. 看证据**
 
@@ -241,14 +247,40 @@ $new | Select-String 'DROP' | Select-String '(160\.79\.10[45]\.|153\.61\.22[4-7]
 | 没有 Anthropic，但有别的 DROP | Claude 在更早的环节就失败了，没走到发起直连那一步。也是安全的，但信息量少 |
 | 一条新增都没有 | 多半是日志还没落盘，等一两分钟再跑一次；或者你用了按行号定位而日志轮转了 |
 
-**7. 恢复**
+**7. 恢复（顺序不能乱）**
+
+恢复顺序错了，会在「正式规则恰好失效 + Claude 还在后台重试」的窗口里制造一次
+真实直连。严格按下面的顺序：
 
 ```powershell
+# ① 完全退出 Claude（不是关窗口）：
+#    托盘图标右键退出；Claude Code CLI 和扩展进程也要退干净，然后确认：
+Get-Process claude -ErrorAction SilentlyContinue | Select-Object ProcessName, Id
+
+# ② 恢复系统代理为【测试前保存的原值】（第 4 步存进 $ksProxyBefore 的那个），
+#    然后手动启动代理进程
+Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -Name ProxyEnable -Value $ksProxyBefore
+
+# ③ 确认代理真的回来了：节点 TCP 通、隧道网卡出现
+Test-NetConnection <你的节点IP> -Port <节点端口> | Select-Object TcpTestSucceeded
+
+# ④ Claude 保持关闭，撤掉临时墙
 Get-NetFirewallRule -Group "Claude-KS-TEMP" | Remove-NetFirewallRule
-Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -Name ProxyEnable -Value 1
+
+# ⑤ 确认撤销：回读应该为空
+Get-NetFirewallRule -Group "Claude-KS-TEMP"
+
+# ⑥ 全部确认之后，才重新打开 Claude
 ```
 
-然后手动启动代理，确认节点连得上、Claude 恢复正常。
+为什么是这个顺序：
+
+- **先退 Claude 再动任何东西**：只要 Claude 还开着，它就在后台重试连接。
+  撤墙、恢复代理的每一个动作都可能恰好发生在它重试的瞬间。
+- **先恢复代理再撤墙**：墙撤掉之后如果代理还没回来，Claude 一旦被重新打开
+  （或还没退干净）就是直连。先让代理可用，撤墙才安全。
+- **恢复 `ProxyEnable` 用保存的原值**：你测试前系统代理可能本来就是关的
+  （比如纯 TUN 模式），无脑写回 1 会改变你的原始状态。
 
 ---
 
@@ -331,9 +363,12 @@ auditpol /get /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}
 「未知程序 → 未知地址」这一格，**任何黑白名单都关不上**。唯一能关上它的是：
 **物理网卡默认拒绝，只放行代理程序本身。**
 
-上面第三阶段的「临时全机墙」就是它的临时版本 —— 把它变成常驻，再加两条
-Allow 例外（代理程序 → 你的节点；Tailscale 之类你确实需要的），就是完整的
-VPN 式 kill-switch。
+注意：第三阶段的「临时全机墙」**不能**直接变成常驻再加 Allow 例外。Windows
+防火墙的规则匹配顺序里，**显式 Block 规则优先于任何 Allow 规则**（见微软文档
+「Rule precedence」）——「全机 Block + 代理 Allow」会把代理自己也挡死，这个
+组合是错的。常驻 kill-switch 需要一套「默认拒绝 + 精确放行」的**独立设计**
+（默认拒绝怎么落地、代理程序怎么白名单、失效时 fail-open 还是 fail-close），
+本项目不含这个方案。
 
 **代价，必须想清楚再做：**
 
