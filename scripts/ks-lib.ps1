@@ -18,13 +18,16 @@ function ConvertTo-KSNormalizedAddress {
     param([string]$Address)
     $a = $Address.Trim()
     if ($a -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$') {
+        # Capture the groups immediately: any later -match would overwrite $Matches.
+        $net = $Matches[1]
+        $mask = $Matches[2]
         $bits = ''
-        foreach ($octet in ($Matches[2].Split('.'))) {
+        foreach ($octet in ($mask.Split('.'))) {
             $bits += [Convert]::ToString([int]$octet, 2).PadLeft(8, '0')
         }
         # Non-contiguous masks are not valid prefix lengths; leave them as-is.
         if ($bits -match '^1*0*$') {
-            return ('{0}/{1}' -f $Matches[1], $bits.TrimEnd('0').Length)
+            return ('{0}/{1}' -f $net, $bits.TrimEnd('0').Length)
         }
     }
     return $a.ToLower()
@@ -189,13 +192,18 @@ function Find-KSWfpBlockOrigin {
 function Get-KSUnsafeAclIdentities {
     param($Acl)
     $safeSids = @('S-1-5-18', 'S-1-5-32-544')
-    $writeRights = [int][System.Security.AccessControl.FileSystemRights]::Write -bor
-                   [int][System.Security.AccessControl.FileSystemRights]::Modify -bor
-                   [int][System.Security.AccessControl.FileSystemRights]::FullControl
+    # Only bits that actually enable code replacement: modify/append content,
+    # delete, rewrite the DACL, or take ownership. Composites like FullControl
+    # include READ bits, so banding against them would flag read-only ACEs.
+    $dangerBits = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
+                  [int][System.Security.AccessControl.FileSystemRights]::AppendData -bor
+                  [int][System.Security.AccessControl.FileSystemRights]::Delete -bor
+                  [int][System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                  [int][System.Security.AccessControl.FileSystemRights]::TakeOwnership
     $unsafe = @()
     foreach ($ace in @($Acl.Access)) {
         if ($ace.AccessControlType -ne 'Allow') { continue }
-        if (([int]$ace.FileSystemRights -band $writeRights) -eq 0) { continue }
+        if (([int]$ace.FileSystemRights -band $dangerBits) -eq 0) { continue }
         $sid = $null
         try {
             $sid = $ace.IdentityReference.Translate(

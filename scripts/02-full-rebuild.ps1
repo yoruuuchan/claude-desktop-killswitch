@@ -28,7 +28,8 @@
        文件系统可验证的路径：WindowsApps 直接扫、C:\Users 遍历、.npmrc 解析。
     ────────────────────────────────────────────────────────────────
 
-    退出码：0 = 所有发现的目标都已覆盖；1 = 有遗漏（看日志）。
+    退出码：0 = 所有发现的目标都已覆盖；
+            1 = 有目标未覆盖，或发现源读取失败 / 一个目标都没发现（看日志）。
     无论哪种情况，都不会删掉任何已存在的东西。
 #>
 
@@ -163,20 +164,6 @@ if ($relTemplate.Count -eq 0) {
     )
 }
 Add-KSSourceStatus 'desktop-package' $srcDesktop
-
-# --- 2. 预置：从 AppX 部署日志里读出「即将安装」的包名 ---
-# Windows 在真正替换文件几小时前就会把新版本的完整包名写进日志（事件 574 / 855），
-# 而且不会在 Claude 运行时替换文件（事件 638）。所以我们可以在新程序还不存在的时候
-# 就为它建好规则 —— 防火墙接受指向不存在路径的规则。这才是消除更新竞态的办法。
-
-# MSIX 包全名的格式是   Name_Version_Architecture__PublisherId
-# 架构可能是 x86 / x64 / arm / arm64 / neutral，不能写死。
-# 从 PackageFamilyName 拆出 Name 和 PublisherId 来约束匹配（避免误伤日志里别的应用），
-# 架构那一段保持开放，并且【从日志里原样提取完整包名】，不自己拼接。
-$pkgName = $pfn -replace '_[^_]+$', ''
-$pubId   = ($pfn -split '_')[-1]
-$fullNameRx = '{0}_[0-9][0-9.]*_(?:x86|x64|arm|arm64|neutral)__{1}' -f
-              [regex]::Escape($pkgName), [regex]::Escape($pubId)
 
 $srcAppxLog = 'absent'
 try {
