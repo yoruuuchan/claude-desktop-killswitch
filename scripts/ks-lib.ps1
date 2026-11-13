@@ -281,3 +281,37 @@ function Get-KSInstallFinalExit {
     param([int]$RebuildExitCode)
     return $RebuildExitCode
 }
+
+<#
+    Identity of a route created by 03-verify.ps1. Cleanup must use the FULL
+    identity (prefix + ifIndex + next hop): deleting by bare prefix would
+    also delete someone else's pre-existing route for the same prefix on a
+    different interface.
+#>
+function New-KSRouteRef {
+    param([string]$Prefix, [int]$IfIndex, [string]$NextHop)
+    [pscustomobject]@{ Prefix = $Prefix; IfIndex = $IfIndex; NextHop = $NextHop }
+}
+
+<#
+    Remove one test route by its full identity and verify by reading back.
+    Returns 'removed' (was there, now gone), 'not-found' (already gone), or
+    'failed' (still present after the attempt — must be reported, never
+    swallowed behind a blanket 'cleaned up').
+#>
+function Remove-KSTestRoute {
+    param($RouteRef)
+    $caught = $null
+    try {
+        Remove-NetRoute -DestinationPrefix $RouteRef.Prefix -InterfaceIndex $RouteRef.IfIndex `
+            -NextHop $RouteRef.NextHop -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop
+    } catch {
+        $caught = $_
+    }
+    $left = @(Get-NetRoute -DestinationPrefix $RouteRef.Prefix -InterfaceIndex $RouteRef.IfIndex `
+        -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+    if ($left.Count -eq 0) {
+        if ($caught) { return 'not-found' } else { return 'removed' }
+    }
+    return 'failed'
+}

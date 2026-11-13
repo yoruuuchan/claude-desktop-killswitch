@@ -138,9 +138,12 @@ try {
     # ================================================= 诱饵路由 + 基线 ====
     Step "第 1 步：把诱饵地址强制走物理网卡，测基线"
 
-    New-NetRoute -DestinationPrefix "$DecoyIP/32" -InterfaceIndex $defRoute.ifIndex `
-        -NextHop $defRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore -Confirm:$false | Out-Null
-    $routesAdded += "$DecoyIP/32"
+    # 记录完整身份（prefix + 接口 + 下一跳）：清理时按完整身份删，
+    # 避免误删其他接口上同前缀的既有路由。
+    $decoyRef = New-KSRouteRef -Prefix "$DecoyIP/32" -IfIndex $defRoute.ifIndex -NextHop $defRoute.NextHop
+    New-NetRoute -DestinationPrefix $decoyRef.Prefix -InterfaceIndex $decoyRef.IfIndex `
+        -NextHop $decoyRef.NextHop -RouteMetric 1 -PolicyStore ActiveStore -Confirm:$false | Out-Null
+    $routesAdded += $decoyRef
     Start-Sleep -Milliseconds 500
 
     if (Test-Tcp $DecoyIP $DecoyPort) {
@@ -251,9 +254,10 @@ try {
             Info "把 $AnthropicIP 强制走物理网卡，去撞你的正式规则。"
             Info "如果规则有效 → 连不上。这一步不产生任何 TLS 握手或域名信息。"
 
-            New-NetRoute -DestinationPrefix "$AnthropicIP/32" -InterfaceIndex $defRoute.ifIndex `
-                -NextHop $defRoute.NextHop -RouteMetric 1 -PolicyStore ActiveStore -Confirm:$false | Out-Null
-            $routesAdded += "$AnthropicIP/32"
+            $anthropicRef = New-KSRouteRef -Prefix "$AnthropicIP/32" -IfIndex $defRoute.ifIndex -NextHop $defRoute.NextHop
+            New-NetRoute -DestinationPrefix $anthropicRef.Prefix -InterfaceIndex $anthropicRef.IfIndex `
+                -NextHop $anthropicRef.NextHop -RouteMetric 1 -PolicyStore ActiveStore -Confirm:$false | Out-Null
+            $routesAdded += $anthropicRef
             Start-Sleep -Milliseconds 500
 
             if (Test-Tcp $AnthropicIP 443) {
@@ -289,14 +293,34 @@ catch {
     $fail += '测试异常'
 }
 finally {
-    # 无论中间出什么事，都把测试用的东西清干净
+    # 无论中间出什么事，都把测试用的东西清干净。
+    # 规则和每条路由独立处理、独立报告：一条删失败不能跳过剩下的，
+    # 更不能吞掉错误后照样打「已清理」。
     Write-Host ''
     Write-Host '  ▸ 清理测试用的规则和路由' -ForegroundColor Cyan
-    Get-NetFirewallRule -Group $TestGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-    foreach ($p in $routesAdded) {
-        Remove-NetRoute -DestinationPrefix $p -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue
+    $ruleCleanOk = $true
+    try {
+        Get-NetFirewallRule -Group $TestGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop
+    } catch {
+        $ruleCleanOk = $false
+        Bad "清理测试规则失败：$($_.Exception.Message)"
+        Info "请手动检查：Get-NetFirewallRule -Group $TestGroup"
     }
-    Ok '已清理'
+    $routeCleanOk = $true
+    foreach ($ref in $routesAdded) {
+        $status = Remove-KSTestRoute -RouteRef $ref
+        switch ($status) {
+            'removed'   { Info ("已删除测试路由 {0}（接口 {1}）" -f $ref.Prefix, $ref.IfIndex) }
+            'not-found' { Info ("测试路由 {0} 已不存在" -f $ref.Prefix) }
+            default     {
+                $routeCleanOk = $false
+                Bad ("删除测试路由 {0} 失败 —— 请手动检查：" -f $ref.Prefix)
+                Info ("  Get-NetRoute -DestinationPrefix {0} -PolicyStore ActiveStore" -f $ref.Prefix)
+            }
+        }
+    }
+    if ($ruleCleanOk -and $routeCleanOk) { Ok '已清理' }
+    else { Bad '清理未完全成功 —— 按上面的提示手动处理，不要留下测试用的规则或路由' }
 }
 
 # ====================================================== 结论 ====
