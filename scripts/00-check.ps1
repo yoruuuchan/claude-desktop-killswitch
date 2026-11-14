@@ -30,6 +30,26 @@ function Info($t) { Write-Host "         $t" -ForegroundColor Gray }
 
 $findings = [System.Collections.Generic.List[string]]::new()
 
+# 批量过滤器索引：先 -All 一次拿基线（约 1~2 秒），再对 -All 结果里缺失的
+# 规则逐条管道补查。-All 单独用不可靠 —— 实测它会漏掉最近创建/修改的规则
+# 的过滤器（210 条 KS 规则只返回 204/209 条）；逐条管道是完整可靠的数据源，
+# 但每条约 195ms，209 条规则 × 3 类过滤器要 2 分多钟。混合后正确性与逐条
+# 等价，总耗时降到几秒 —— -All 真缺很多时也只是优雅退化回逐条速度。
+# 过滤器对象按 InstanceID（= 规则 Name GUID）索引。
+function New-KSFilterIndex {
+    param([string]$FilterCommand, [object[]]$Rules)
+    $idx = @{}
+    & $FilterCommand -All -ErrorAction SilentlyContinue |
+        ForEach-Object { $idx[$_.InstanceID] = $_ }
+    foreach ($r in @($Rules)) {
+        if (-not $idx.ContainsKey($r.Name)) {
+            $f = @($r | & $FilterCommand -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($f) { $idx[$r.Name] = $f[0] }
+        }
+    }
+    return $idx
+}
+
 Write-Host ''
 Write-Host '  Claude 防直连 —— 环境体检（只读，不会改动任何东西）' -ForegroundColor White
 
@@ -168,9 +188,18 @@ try {
 }
 
 $ksRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Group -like 'Claude-KS*' })
+$laudeRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -match 'laude' -or $_.Group -like 'Claude-KS*' })
+
+# 过滤器索引（ApplicationFilter 服务脱靶检测 —— 无论装没装本项目规则都要跑）。
+$appById = New-KSFilterIndex -FilterCommand 'Get-NetFirewallApplicationFilter' -Rules $laudeRules
+
 if ($ksRules.Count -gt 0) {
     Ok "本项目的规则已安装：共 $($ksRules.Count) 条"
     $ksRules | Group-Object Group | ForEach-Object { Info ("  {0,-18} {1} 条" -f $_.Name, $_.Count) }
+
+    $addrById = New-KSFilterIndex -FilterCommand 'Get-NetFirewallAddressFilter' -Rules $ksRules
+    $ifById   = New-KSFilterIndex -FilterCommand 'Get-NetFirewallInterfaceFilter' -Rules $ksRules
 
     # Windows may return CIDR prefixes as dotted subnet masks; accept either representation.
     $blocked = @()
@@ -178,7 +207,8 @@ if ($ksRules.Count -gt 0) {
         if ($rule.Enabled -ne 'True' -or $rule.Direction -ne 'Outbound' -or $rule.Action -ne 'Block') {
             continue
         }
-        $blocked += @(($rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue).RemoteAddress)
+        $af = $addrById[$rule.Name]
+        if ($af) { $blocked += @($af.RemoteAddress) }
     }
     $requiredV4 = @(
         @{ CIDR = '160.79.104.0/23'; Formats = @('160.79.104.0/23', '160.79.104.0/255.255.254.0') }
@@ -217,9 +247,13 @@ if ($ksRules.Count -gt 0) {
     # 被旧规则自动覆盖 —— 那是一个没人提醒的防护缺口。
     # 指向已不存在路径的旧规则除外（只增不删留下的，本来就无害，见下面的脱靶检测）。
     foreach ($rule in $ksRules) {
-        $prog = ($rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program
+        $prog = $null
+        $apf = $appById[$rule.Name]
+        if ($apf) { $prog = $apf.Program }
         if ($prog -and $prog -ne 'Any' -and -not (Test-Path $prog)) { continue }
-        $ifa = @(($rule | Get-NetFirewallInterfaceFilter -ErrorAction SilentlyContinue).InterfaceAlias)
+        $ifa = @()
+        $iff = $ifById[$rule.Name]
+        if ($iff) { $ifa = @($iff.InterfaceAlias) }
         $missingIf = @($phys.Name | Where-Object { $ifa -notcontains $_ })
         if ($missingIf.Count -gt 0) {
             Warn "规则「$($rule.DisplayName)」没有覆盖当前全部物理网卡（缺：$($missingIf -join '、')）"
@@ -236,15 +270,15 @@ if ($ksRules.Count -gt 0) {
 #   · 别人/你以前写的 Block 规则指向旧路径 —— 那些规则现在【一条都不生效】。
 $staleMine = @()
 $staleOther = @()
-Get-NetFirewallRule -ErrorAction SilentlyContinue |
-    Where-Object { $_.DisplayName -match 'laude' -or $_.Group -like 'Claude-KS*' } |
-    ForEach-Object {
-        $p = ($_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program
-        if ($p -and $p -ne 'Any' -and -not (Test-Path $p)) {
-            $item = [pscustomobject]@{ Rule = $_.DisplayName; Program = $p; Action = $_.Action }
-            if ($_.Group -like 'Claude-KS*') { $staleMine += $item } else { $staleOther += $item }
-        }
+foreach ($r in $laudeRules) {
+    $p = $null
+    $apf = $appById[$r.Name]
+    if ($apf) { $p = $apf.Program }
+    if ($p -and $p -ne 'Any' -and -not (Test-Path $p)) {
+        $item = [pscustomobject]@{ Rule = $r.DisplayName; Program = $p; Action = $r.Action }
+        if ($r.Group -like 'Claude-KS*') { $staleMine += $item } else { $staleOther += $item }
     }
+}
 
 if ($staleMine.Count -gt 0) {
     Info ''
