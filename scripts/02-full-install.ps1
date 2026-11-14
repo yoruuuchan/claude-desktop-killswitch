@@ -1,4 +1,4 @@
-﻿<#
+<#
     Claude 防直连 —— 完整防护
 
     在基础防护（按目的地封 Anthropic 网段）之上，再加一层按【进程】封：
@@ -30,9 +30,10 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ks-lib.ps1')
 
 $InstallDir = 'C:\ProgramData\ClaudeKillSwitch'
-$RebuildDst = Join-Path $InstallDir 'rebuild.ps1'
-$LibDst     = Join-Path $InstallDir 'ks-lib.ps1'
-$TaskName   = 'Claude KS Rebuild'
+$RebuildDst  = Join-Path $InstallDir 'rebuild.ps1'
+$LibDst      = Join-Path $InstallDir 'ks-lib.ps1'
+$LauncherDst = Join-Path $InstallDir 'run-hidden.vbs'
+$TaskName    = 'Claude KS Rebuild'
 
 function Fail($m) { Write-Host "  [失败] $m" -ForegroundColor Red; exit 1 }
 function Ok($m)   { Write-Host "  [ 好 ] $m" -ForegroundColor Green }
@@ -52,6 +53,8 @@ $RebuildSrc = Join-Path $PSScriptRoot '02-full-rebuild.ps1'
 if (-not (Test-Path $RebuildSrc)) { Fail "找不到 $RebuildSrc" }
 $LibSrc = Join-Path $PSScriptRoot 'ks-lib.ps1'
 if (-not (Test-Path $LibSrc)) { Fail "找不到 $LibSrc" }
+$LauncherSrc = Join-Path $PSScriptRoot 'run-hidden.vbs'
+if (-not (Test-Path $LauncherSrc)) { Fail "找不到 $LauncherSrc" }
 
 if (-not (Get-NetFirewallRule -Group 'Claude-KS' -ErrorAction SilentlyContinue)) {
     Warn '还没装基础防护。建议先跑 .\01-basic.ps1 —— 那一层是身份无关的，'
@@ -70,7 +73,7 @@ if (-not $pkg) {
 Write-Host ''
 Info '即将安装的东西：'
 Info "  · 脚本      $RebuildDst"
-Info "  · 计划任务  「$TaskName」（以你当前账号运行，最高权限）"
+Info "  · 计划任务  「$TaskName」（以你当前账号运行，最高权限；wscript 隐藏窗口）"
 Info '  · 防火墙规则组 Claude-KS-App —— 每个 Claude 相关程序两条（IPv4 / IPv6）'
 Write-Host ''
 Info '规则数量会比较多（几十到上百条），这是正常的 —— Claude 的扩展自带一整个'
@@ -136,6 +139,7 @@ Ok "目录已就绪并通过 ACL 校验：$InstallDir"
 
 Copy-Item $RebuildSrc $RebuildDst -Force
 Copy-Item $LibSrc $LibDst -Force
+Copy-Item $LauncherSrc $LauncherDst -Force
 Ok "脚本已安装：$RebuildDst"
 
 # ---- 2. 注册计划任务 ----
@@ -198,8 +202,8 @@ $xml = @"
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>powershell.exe</Command>
-      <Arguments>-NoProfile -ExecutionPolicy Bypass -File "$RebuildDst"</Arguments>
+      <Command>wscript.exe</Command>
+      <Arguments>//B //NoLogo "$LauncherDst" "$RebuildDst"</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -212,6 +216,7 @@ $xmlPath = Join-Path $InstallDir 'task.xml'
 if ($LASTEXITCODE -ne 0) { Fail "计划任务注册失败（schtasks 退出码 $LASTEXITCODE）" }
 Ok "计划任务已注册：$TaskName"
 Info '触发条件：Claude 更新事件（574/855/617）、登录时、每 10 分钟兜底'
+Info '窗口：经 wscript 隐藏启动，重建运行时不会弹出控制台窗口。'
 
 # ---- 3. 立刻跑一次 ----
 Write-Host ''
