@@ -117,6 +117,30 @@ Anthropic 当前公布的入站 IPv4 包含 `153.61.224.0/22`。如果之前安�
 
 ---
 
+## 可选：DNS / UDP / STUN 网络体检
+
+参考 Claude Net Env Kit 的出口、DNS、STUN 检查思路，补充一份**只读的独立网络诊断**。它不会创建防火墙规则、修改 mihomo / Mesl 配置、设置时区、安装任务，也不会自动把 STUN 端口强制导向某个代理组。
+
+```powershell
+# 默认只查看网卡和 DNS 配置（不发起外部探针请求）
+.\scripts\04-network-audit.ps1
+
+# 可选：通过显式 HTTP 代理与独立 UDP socket 比较两个 IPv4 出口
+.\scripts\04-network-audit.ps1 -ProxyUrl 'http://127.0.0.1:10808' -ProbeStun
+```
+
+`-ProxyUrl` 是 HTTP 代理端口示例，请替换为自己客户端真实的 HTTP/mixed 监听端口；它不是 SOCKS5 端口。两条探针分别访问 `api4.ipify.org` 和 `stun.l.google.com:19302`；STUN 服务器可能看到你的真实出口 IP，故只在传入 `-ProbeStun` 后才发送请求。
+
+| 退出码 | 精确含义 |
+|---|---|
+| `0` | HTTP 代理 IPv4 出口与独立 UDP/STUN 所见 IPv4 相同；**只说明这两次探针一致** |
+| `1` | 两者不同，UDP 可能绕过代理，需要检查 TUN / UDP 路由；不同代理策略也可能使用不同出口 |
+| `2` | 未开启双探针，或任一探针失败、超时、响应无效；**未验证** |
+
+DNS 服务器列表说明操作系统的配置，无法证明浏览器、代理客户端或应用是否使用 DoH、远端 DNS 或明文 DNS；WebRTC 需要在实际浏览器中单独验证。STUN **超时、没有候选地址、格式错误都归入未验证**。网络诊断只补充观察，不替代 `03-verify.ps1` 的防火墙诱饵测试，也不承诺任何账号风控结果。检查方法不要求美国 ISP 或美国时区。
+
+---
+
 ## 完整版
 
 基础版按**目的地**拦，只覆盖 Anthropic 自己的 IP 段。但 Claude 也会连一些第三方托管的地址 —— 比如 `statsig.anthropic.com` 解析到 `34.36.57.103`，那是 Google Cloud，不在 Anthropic 网段里，按目的地拦不住。
@@ -321,6 +345,8 @@ Claude Desktop 包内还有 `cowork-svc.exe`、`chrome-native-host.exe` 等；�
 | `scripts/02-full-rebuild.ps1` | 被计划任务调用的重建脚本（只增不删） |
 | `scripts/ks-lib.ps1` | 共享判断函数库（规则健康判定、门禁、清理），被主脚本和测试引用 |
 | `scripts/03-verify.ps1` | 诱饵验证，证明规则真的会开火 |
+| `scripts/04-network-audit.ps1` | 可选的只读 DNS、HTTP 代理出口与独立 UDP/STUN 诊断 |
+| `scripts/ks-stun.ps1` | 严格解析 STUN 应答（包含事务 ID 校验与 IPv4/IPv6 地址） |
 | `scripts/99-uninstall.ps1` | 全部撤销（先停计划任务再删规则） |
 | `docs/verification.md` | 完整的零泄漏验证流程 |
 | `tests/run-tests.ps1` | 回归测试（纯 mock，不碰真实防火墙） |
@@ -334,7 +360,7 @@ Claude Desktop 包内还有 `cowork-svc.exe`、`chrome-native-host.exe` 等；�
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1
 ```
 
-- **单元测试**：76 条断言全绿。覆盖规则健康四场景（禁用 / 改地址 / 缺新网卡 / 健康）、`-TestAnthropic` 门禁与退出码语义、发现源失败传播、路由按完整身份清理、安装目录 ACL 判定。
+- **单元测试**：85 条断言全绿。覆盖规则健康四场景（禁用 / 改地址 / 缺新网卡 / 健康）、`-TestAnthropic` 门禁与退出码语义、发现源失败传播、路由按完整身份清理、安装目录 ACL 判定，以及 STUN IPv4/IPv6 解析、事务 ID 与畸形应答处理。
 - **真机验证**（2026-11，Windows 11 + sing-box TUN + v2rayN，WLAN）：诱饵 A/B（按目的地、按程序）实测开火；`-TestAnthropic` 在 Claude CLI 存活时实测拒绝执行（退出码 `2`）；同名规则缺网卡绑定实测被 `Set-NetFirewallRule` 原地修复；测试路由按完整身份清理、零残留。IPv6 / UDP/QUIC 路径与拔插头端到端测试未在本机做。
 
 ---
