@@ -42,7 +42,11 @@
 
 - 不在需要代理的地区
 - 用的是路由器级/网关级代理，本机根本没有直连出口
-- macOS / Linux（这套是 Windows 防火墙实现，其他系统要用 pf / nftables 重写）
+- 非 Windows 用户（本仓库只提供 Windows 实现；macOS 可使用下方独立实现，Linux 需要用 nftables 等机制另行实现）
+
+## 其他平台实现
+
+- **macOS**：[W0gdx/claude-killswitch-macos](https://github.com/W0gdx/claude-killswitch-macos) — 基于 `pf + launchd`，按目的地址过滤；支持检查、安装/升级、验证和卸载，并已完成 IPv4/TCP 诱饵真机验证。与本仓库 Windows 完整版按进程过滤的保护范围不同，具体边界见其 README。
 
 ---
 
