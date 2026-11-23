@@ -47,19 +47,11 @@ $Stamp   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 function Write-Log([string]$m) { "$Stamp $m" | Add-Content -Path $LogFile -Encoding UTF8 }
 
-# 公网 IPv4。故意排除：回环 127/8、RFC1918、CGNAT 100.64/10（Tailscale 用这段）、
-# 链路本地 169.254/16。所以局域网、Tailscale、localhost 全部照常。
-$Public4 = @(
-    '1.0.0.0-9.255.255.255'
-    '11.0.0.0-100.63.255.255'
-    '100.128.0.0-126.255.255.255'
-    '128.0.0.0-169.253.255.255'
-    '169.255.0.0-172.15.255.255'
-    '172.32.0.0-192.167.255.255'
-    '192.169.0.0-223.255.255.255'
-)
-# 公网 IPv6 = 全球单播 + NAT64。不含 fe80::/10 和 fc00::/7（Tailscale 的 ULA 在这里）。
-$Public6 = @('2000::/3', '64:ff9b::/96', '64:ff9b:1::/48')
+# 公网地址集合由 ks-lib 统一维护：排除回环、RFC1918、CGNAT 100.64/10
+# （Tailscale 用这段）和链路本地，所以局域网、Tailscale、localhost 全部照常。
+$public = Get-KSPublicAddressSets
+$Public4 = $public.V4
+$Public6 = $public.V6
 
 $phys = @((Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
             Where-Object { $_.Status -ne 'Not Present' }).Name)

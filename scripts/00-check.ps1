@@ -7,6 +7,7 @@
       · 哪些是物理网卡（规则会绑在这些上面）
       · IPv6 是不是一个正在敞开的漏洞
       · 有没有已经脱靶的旧规则
+      · Anthropic 与 Sift 等已知端点解析到哪里
       · 该不该装、装哪一档
 
     不需要管理员权限。
@@ -30,25 +31,8 @@ function Info($t) { Write-Host "         $t" -ForegroundColor Gray }
 
 $findings = [System.Collections.Generic.List[string]]::new()
 
-# 批量过滤器索引：先 -All 一次拿基线（约 1~2 秒），再对 -All 结果里缺失的
-# 规则逐条管道补查。-All 单独用不可靠 —— 实测它会漏掉最近创建/修改的规则
-# 的过滤器（210 条 KS 规则只返回 204/209 条）；逐条管道是完整可靠的数据源，
-# 但每条约 195ms，209 条规则 × 3 类过滤器要 2 分多钟。混合后正确性与逐条
-# 等价，总耗时降到几秒 —— -All 真缺很多时也只是优雅退化回逐条速度。
-# 过滤器对象按 InstanceID（= 规则 Name GUID）索引。
-function New-KSFilterIndex {
-    param([string]$FilterCommand, [object[]]$Rules)
-    $idx = @{}
-    & $FilterCommand -All -ErrorAction SilentlyContinue |
-        ForEach-Object { $idx[$_.InstanceID] = $_ }
-    foreach ($r in @($Rules)) {
-        if (-not $idx.ContainsKey($r.Name)) {
-            $f = @($r | & $FilterCommand -ErrorAction SilentlyContinue | Select-Object -First 1)
-            if ($f) { $idx[$r.Name] = $f[0] }
-        }
-    }
-    return $idx
-}
+# Shared pure helpers (address sets, endpoint catalog, batched filter reads).
+. (Join-Path $PSScriptRoot 'ks-lib.ps1')
 
 Write-Host ''
 Write-Host '  Claude 防直连 —— 环境体检（只读，不会改动任何东西）' -ForegroundColor White
@@ -154,22 +138,42 @@ if (-not $hasV6Internet) {
 }
 
 
-# --------------------------------------------------------- Anthropic ----
-Section '4. Anthropic 的地址'
+# ------------------------------------------- Anthropic 与第三方端点 ----
+Section '4. Anthropic 与第三方端点（只读）'
 
-foreach ($n in 'api.anthropic.com', 'claude.ai', 'statsig.anthropic.com') {
-    $ips = @()
-    foreach ($t in 'A', 'AAAA') {
-        try { $ips += (Resolve-DnsName -Name $n -Type $t -ErrorAction Stop | Where-Object IPAddress).IPAddress } catch {}
+$anthroRanges = Get-KSAnthropicRanges
+$officialPrefixes = @($anthroRanges.V4) + @($anthroRanges.V6)
+$thirdPartyOutside = $false
+foreach ($endpoint in (Get-KSKnownEndpoints)) {
+    $dns = Get-KSEndpointDnsRecords -Name $endpoint.Name
+    if (-not $dns.Resolved) {
+        if ($endpoint.Category -eq 'Historical') {
+            Warn ("{0,-24} 未解析 —— {1}" -f $endpoint.Name, $endpoint.Note)
+        } else {
+            Warn ("{0,-24} 未解析（无法判断它落在哪里）" -f $endpoint.Name)
+        }
+        continue
     }
-    if ($ips) { Info ("{0,-24} {1}" -f $n, ($ips -join '  ')) }
-    else      { Info ("{0,-24} （解析不到）" -f $n) }
+    $cname = if ($dns.CNAME.Count -gt 0) { 'CNAME ' + ($dns.CNAME -join ' -> ') + ' -> ' } else { '' }
+    $tag = switch (Get-KSAddressSetCoverage -IPAddresses $dns.IPAddresses -Prefixes $officialPrefixes) {
+        'covered'     { '官方段内' }
+        'not-covered' { '官方段外' }
+        'partial'     { '部分官方段内' }
+        default       { '未验证' }
+    }
+    Info ("{0,-24} {1}{2}  [{3}]" -f $endpoint.Name, $cname, ($dns.IPAddresses -join ', '), $tag)
+    Info ("  {0}；{1}" -f $endpoint.Role, $endpoint.Note)
+    if ($endpoint.Category -eq 'ThirdParty' -and $tag -ne '官方段内') { $thirdPartyOutside = $true }
 }
 Info ''
-Info '注意：statsig.anthropic.com 通常不在 Anthropic 自己的网段里（托管在 Google Cloud）。'
-Info '      这就是为什么光按目的地封不够，完整版还要按进程封一层。'
+Info '基础版按目的地只封 Anthropic 官方网段。Sift 等第三方 CDN / 遥测地址不在其中；'
+Info '完整版按进程封 Claude 程序的全部公网目的地，能覆盖 Claude 程序对这些地址的访问。'
+Info '浏览器进程不在完整版范围内 —— 网页端的 Sift 信标需要单独评估，详见 README 与 05-coverage.ps1。'
+if ($thirdPartyOutside) {
+    Info 'Sift CDN 是共享基础设施，解析 IP 会变；本项目不会按这些 IP 建阻断规则。'
+}
 Info ''
-Info '本脚本【不会】去实际连接这些地址 —— 那本身就是一次直连。'
+Info '本脚本【不会】去实际连接这些地址 —— 只做 DNS 解析，不发起 TCP / TLS。'
 
 
 # ------------------------------------------------------- 现有规则 ----
@@ -192,14 +196,14 @@ $laudeRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
     Where-Object { $_.DisplayName -match 'laude' -or $_.Group -like 'Claude-KS*' })
 
 # 过滤器索引（ApplicationFilter 服务脱靶检测 —— 无论装没装本项目规则都要跑）。
-$appById = New-KSFilterIndex -FilterCommand 'Get-NetFirewallApplicationFilter' -Rules $laudeRules
+$appById = Get-KSFilterIndex -FilterCommand 'Get-NetFirewallApplicationFilter' -Rules $laudeRules
 
 if ($ksRules.Count -gt 0) {
     Ok "本项目的规则已安装：共 $($ksRules.Count) 条"
     $ksRules | Group-Object Group | ForEach-Object { Info ("  {0,-18} {1} 条" -f $_.Name, $_.Count) }
 
-    $addrById = New-KSFilterIndex -FilterCommand 'Get-NetFirewallAddressFilter' -Rules $ksRules
-    $ifById   = New-KSFilterIndex -FilterCommand 'Get-NetFirewallInterfaceFilter' -Rules $ksRules
+    $addrById = Get-KSFilterIndex -FilterCommand 'Get-NetFirewallAddressFilter' -Rules $ksRules
+    $ifById   = Get-KSFilterIndex -FilterCommand 'Get-NetFirewallInterfaceFilter' -Rules $ksRules
 
     # Windows may return CIDR prefixes as dotted subnet masks; accept either representation.
     $blocked = @()
@@ -210,16 +214,20 @@ if ($ksRules.Count -gt 0) {
         $af = $addrById[$rule.Name]
         if ($af) { $blocked += @($af.RemoteAddress) }
     }
-    $requiredV4 = @(
-        @{ CIDR = '160.79.104.0/23'; Formats = @('160.79.104.0/23', '160.79.104.0/255.255.254.0') }
-        @{ CIDR = '153.61.224.0/22'; Formats = @('153.61.224.0/22', '153.61.224.0/255.255.252.0') }
-    )
-    foreach ($item in $requiredV4) {
-        if (@($item.Formats | Where-Object { $_ -in $blocked }).Count -gt 0) {
-            Ok "IPv4 网段已拦截：$($item.CIDR)"
+    foreach ($cidr in $anthroRanges.V4) {
+        if (Test-KSAddressCoverage -Expected @($cidr) -Actual $blocked) {
+            Ok "IPv4 网段已拦截：$cidr"
         } else {
-            Bad "IPv4 网段缺少有效阻断：$($item.CIDR)"
+            Bad "IPv4 网段缺少有效阻断：$cidr"
             $findings.Add('V4_MISSING')
+        }
+    }
+    foreach ($cidr in $anthroRanges.V6) {
+        if (Test-KSAddressCoverage -Expected @($cidr) -Actual $blocked) {
+            Ok "IPv6 网段已拦截：$cidr"
+        } else {
+            Bad "IPv6 网段缺少有效阻断：$cidr"
+            $findings.Add('V6_MISSING')
         }
     }
 
@@ -309,8 +317,8 @@ if ($findings -contains 'V4_MISSING') {
     Bad '当前 IPv4 防护不完整。更新仓库脚本后重新运行 .\01-basic.ps1，补齐缺失网段。'
 }
 
-if ($findings -contains 'FW_PROFILE_OFF') {
-    Bad 'Windows 防火墙本身没有全开。先把防火墙打开，任何规则才有意义。'
+if ($findings -contains 'V6_MISSING') {
+    Bad '当前 Anthropic IPv6 防护不完整。更新仓库脚本后重新运行 .\01-basic.ps1，补齐缺失网段。'
 }
 
 if ($findings -contains 'NOT_ACTIVE') {
@@ -323,6 +331,9 @@ if ($findings -contains 'IFACE_GAP') {
 
 if ($findings -contains 'NO_PHYSICAL') {
     Bad '没有物理网卡，装不了。'
+}
+elseif ($findings -contains 'FW_PROFILE_OFF') {
+    Bad 'Windows 防火墙没有全开。先把防火墙打开再装 —— 否则规则一条都不会生效。'
 }
 elseif ($findings -contains 'NO_PROXY') {
     Bad '请先把代理跑起来再装。现在装只会让 Claude 直接不能用。'
@@ -342,5 +353,6 @@ else {
     Info '「加了规则而且没坏」不等于「规则生效了」，两者现象一模一样。'
     Write-Host ''
     Info '想更完整（覆盖 Anthropic 之外的第三方地址）再跑 .\02-full-install.ps1'
+    Info '装完可跑 .\05-coverage.ps1 只读核对当前程序与第三方端点的覆盖情况。'
 }
 Write-Host ''

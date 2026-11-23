@@ -104,6 +104,14 @@ function Get-WinEvent {
     if ($script:MockWinEventThrows) { throw 'mock Get-WinEvent failed (audit not enabled)' }
     @($script:MockWinEvents)
 }
+$script:MockDnsRecords = @{}
+$script:MockDnsThrows = $false
+function Resolve-DnsName {
+    [CmdletBinding()] param($Name, $Type, $Server)
+    if ($script:MockDnsThrows) { throw 'mock DNS failure' }
+    if ($script:MockDnsRecords.ContainsKey($Name)) { return @($script:MockDnsRecords[$Name]) }
+    throw "mock: no records for $Name"
+}
 
 # Mock firewall rule object. Filter data travels on the object itself
 # (_RemoteAddress / _Program / _InterfaceAlias) so the filter mocks above

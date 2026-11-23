@@ -5,8 +5,9 @@
     把 Claude 全家从物理网卡上封掉所有公网地址，不看目的地。
 
     为什么需要这一层：
-      Claude 也会连一些第三方托管的地址，比如 statsig.anthropic.com
-      解析到 Google Cloud，根本不在 Anthropic 的网段里。按目的地封拦不住。
+      Claude 也会连一些第三方托管的地址，比如客户端遥测 / 实验端点、
+      Claude Code 的 Sentry / Datadog 上报，都不在 Anthropic 的网段里。
+      按目的地封拦不住，只能按进程封。
 
     这个脚本会：
       1. 把 02-full-rebuild.ps1 复制到 C:\ProgramData\ClaudeKillSwitch\rebuild.ps1

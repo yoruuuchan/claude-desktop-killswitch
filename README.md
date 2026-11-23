@@ -90,9 +90,12 @@
 
 # 3. 验证它真的会开火（用诱饵地址，全程不碰 Anthropic）
 .\scripts\03-verify.ps1
+
+# 4. 装完 / Claude 更新后，只读核对覆盖（可选但推荐）
+.\scripts\05-coverage.ps1
 ```
 
-**先跑 `00-check.ps1`。** 它会告诉你：你是什么代理模式、有哪些物理网卡、IPv6 是不是漏的、有没有已经脱靶的旧规则；还会核对 Windows 防火墙本身是否开启、已装的规则是否真的在生效存储（ActiveStore）里、是否覆盖当前**全部**物理网卡——插了新网卡（USB 网卡 / 扩展坞）而旧规则没绑上，体检会直接告诉你。这套方案的所有正确性都建立在「先量后写」上，别抄了就跑。
+**先跑 `00-check.ps1`。** 它会告诉你：你是什么代理模式、有哪些物理网卡、IPv6 是不是漏的、有没有已经脱靶的旧规则；还会核对 Windows 防火墙本身是否开启、已装的规则是否真的在生效存储（ActiveStore）里、是否覆盖当前**全部**物理网卡——插了新网卡（USB 网卡 / 扩展坞）而旧规则没绑上，体检会直接告诉你。它也会解析 Anthropic 与 Sift 等已知端点，标出哪些在官方网段里、哪些按目的地拦不住。这套方案的所有正确性都建立在「先量后写」上，别抄了就跑。
 
 基础版做了两件事：
 
@@ -143,15 +146,21 @@ Anthropic 当前公布的入站 IPv4 包含 `153.61.224.0/22`。如果之前安�
 
 DNS 服务器列表说明操作系统的配置，无法证明浏览器、代理客户端或应用是否使用 DoH、远端 DNS 或明文 DNS；WebRTC 需要在实际浏览器中单独验证。STUN **超时、没有候选地址、格式错误都归入未验证**。
 
+这份体检只比较 HTTP 代理出口与独立 UDP/STUN 出口，**不检查 Sift / Datadog / Sentry 等第三方遥测端点**。后者由 `05-coverage.ps1` 做只读 DNS 核对，不发起连接。
+
 ---
 
 ## 完整版
 
-基础版按**目的地**拦，只覆盖 Anthropic 自己的 IP 段。但 Claude 也会连一些第三方托管的地址 —— 比如 `statsig.anthropic.com` 解析到 `34.36.57.103`，那是 Google Cloud，不在 Anthropic 网段里，按目的地拦不住。
+基础版按**目的地**拦，只覆盖 Anthropic 自己的 IP 段。但 Claude 的流量不只在 Anthropic 网段里：
+
+- 网页端加载的 `s-cdn.anthropic.com/s.js` 是 Sift 托管的浏览器信标，当前 DNS 是 CNAME → `b-0.hexagon-cdn.com` → `34.54.194.141`（Google Cloud），不在 Anthropic 官方网段里。它影响的是浏览器里的 claude.ai / platform.claude.com，不等于桌面端原生程序的设备标识。
+- Claude Code CLI 的错误上报走 Sentry 和 Datadog，端点托管在 Google Cloud / AWS 网段（例如 `34.149.x.x` / `2600:1901::`），同样不在 Anthropic 网段里。
+- 早前 README 记录过 `statsig.anthropic.com` → `34.36.57.103`；2026-11-23 复核时该域名在权威 DNS 返回 NXDOMAIN，旧 IP 不能再当作固定地址。完整版不依赖具体域名，所以不受影响。
 
 完整版补上按**进程**拦的一层：把 Claude 全家（Desktop 包内程序、扩展进程、Claude Code CLI）从物理网卡上封掉**所有公网地址**，不看目的地。
 
-为什么要封到「所有公网地址」而不只是 Anthropic 网段：Claude Code CLI 的错误上报走 Sentry 和 Datadog，这些端点托管在 Google Cloud 网段（`34.149.x.x` / `2600:1901::`），**不在 Anthropic 的 IP 段里**——按目的地拦不住。更麻烦的是，代理掉线时 CLI 连不上 API 这件事本身会触发错误上报（`tengu_streaming_error` 一类事件，带 `device_id` 和 `account_uuid`），等于「拦截动作自己制造泄露」。按进程封一层不看目的地，这类侧信道全部关死。
+为什么要封到「所有公网地址」：代理掉线时 CLI 连不上 API 这件事本身会触发错误上报（`tengu_streaming_error` 一类事件，带 `device_id` 和 `account_uuid`），等于「拦截动作自己制造泄露」。按进程封一层不看目的地，这类侧信道全部关死；Sift / Sentry / Datadog 换哪个 IP 都不影响。
 
 ```powershell
 .\scripts\02-full-install.ps1
@@ -214,6 +223,36 @@ Enable-ScheduledTask -TaskName 'Claude KS Rebuild'
 停用期间规则仍然在生效，只是新版本的程序路径不会被自动补上。恢复后下一次触发就会补齐；想立刻补就跑一次 `.\scripts\02-full-install.ps1`。
 
 从旧版升级也一样：重新运行 `02-full-install.ps1` 会就地替换计划任务定义和安装目录里的脚本（`schtasks /Create /F`），不需要先卸载。
+
+---
+
+## Sift、第三方遥测与桌面端 / 网页端边界（2026-11 复核）
+
+Claude 的网页端除了 Anthropic 自己的接口，还会加载第三方风控与分析组件。最值得知道的是 Sift：
+
+- `claude.ai` 和 `platform.claude.com` 的页面会加载 `s-cdn.anthropic.com/s.js`。它名义上是 Anthropic 子域名，DNS 实际是 CNAME → `b-0.hexagon-cdn.com`，由反欺诈公司 Sift 托管。2026-11-23 在本机用 DoH 复核：`s-cdn.anthropic.com` → `b-0.hexagon-cdn.com` → `34.54.194.141`（Google Cloud），不在 Anthropic 官方网段内。本机系统解析器会把 CNAME 压平成 A 记录，直接 `Resolve-DnsName` 看不到 CNAME；这是解析器行为，不代表记录不存在。
+- 据 [riba2534 的 2026-11 研究](https://x.com/riba2534/status/2124194803575607364)（代码分析 + 沙箱实测），该脚本在页面路径每变化一次时上报约 79 个字段、约 1.2 KB 的 1×1 GIF。内容包括账户 UUID（明文）、当前完整 URL 和页面标题、`__ssid` cookie、canvas / WebGL / 音频 / CPU 核数 / 内存 / 屏幕等指纹，以及 webdriver、无痕、篡改检测信号。它不监听键盘鼠标、不读剪贴板、不拿硬件序列号；清 cookie 只会换掉随机会话 ID，74 个稳定字段不变。所以它是「浏览器安装级」识别，不是机器码级。
+- 同一研究指出，Anthropic 原生客户端默认使用「随机生成、存在文件里的安装 ID」，不是硬件机器码。桌面端的主要关联面仍是账户和出口 IP；Sift 的浏览器指纹主要针对网页端。
+- 研究还指出 claude.ai 网页端有 Datadog RUM、Segment、GrowthBook 等分析 / 开关组件；它们不属于风控。Anthropic 的子处理者清单把 Sift 列为 "Fraud and abuse detection"，覆盖除 Claude for Government 外的产品。精确主机随版本和配置变化，本项目不硬编码。
+- 上面这些细节里，**本仓库实测的是当前 DNS 链**；79 个字段、证书归属、登录态上报内容来自第三方研究，其中「登录后随对话上报账户 UUID / 对话 URL」只有代码证据、没有登录抓包。我们只把它当作风险证据，不把它写成已复现事实。
+
+这对 kill-switch 意味着什么：
+
+| 场景 | 基础版（按目的地） | 完整版（按进程） |
+|---|---|---|
+| Claude 桌面端 / CLI → Anthropic 官方网段 | ✅ | ✅ |
+| Claude 桌面端 / CLI → Sift / Sentry / Datadog 等第三方地址 | ❌ 不在 Anthropic 网段 | ✅ 封 Claude 程序的全部公网目的地 |
+| 浏览器 → claude.ai | ⚠️ 只封 Anthropic 网段；页面本身打不开 | ❌ 不覆盖浏览器进程 |
+| 浏览器 → Sift CDN | ❌ 共享 CDN，不在 Anthropic 网段 | ❌ 不覆盖浏览器进程 |
+
+所以：
+
+- 想关掉 Claude 程序自己的第三方遥测侧信道，用完整版。它不看域名和 IP，Sift 换 CDN / 换地址都不影响。
+- 完整版按 Claude 可执行文件路径封。只要网页内容在 Claude 自己的进程树里渲染（当前 Electron 包如此），它也在覆盖内；如果未来客户端改用独立的 WebView2 宿主，这条规则不会自动覆盖那个进程，需要用 `05-coverage.ps1` 重新核对。
+- 浏览器里的 claude.ai 不在完整版保护范围内。代理挂掉时不要继续用已打开的 claude.ai 页面；基础版只能保证新的 Anthropic 请求打不开，不能保证页面里已经加载的第三方信标不出去。
+- 本项目**不会**按 `s-cdn.anthropic.com` 或 Sift 的解析 IP 建阻断规则。原因：`b-0.hexagon-cdn.com` 是 Sift 客户的共享 CDN（研究记录同一张证书还覆盖 OpenTable、Razorpay、DigitalOcean 等客户），IP 动态；按域名写防火墙规则遇到 DoH 会 fail-open，hosts 又会被代理绕过。这类规则误伤大、验证不了，只会制造虚假的安全感。可靠的做法是按进程封，或者不把浏览器留在 claude.ai 页面。
+
+`.\scripts\05-coverage.ps1` 可以只读核对：官方端点是否仍在基础版网段内、完整版是否覆盖当前所有 Claude 程序、Sift 端点解析到哪里。它不连接这些地址，也不改规则。退出码 `0` = 已安装层健康，`1` = 发现覆盖缺口，`2` = 无法完整核对。
 
 ---
 
@@ -310,6 +349,10 @@ Windows 11 确实支持按域名写防火墙规则（`New-NetFirewallDynamicKeyw
 
 覆盖不全（子域名、新域名），而且很多代理客户端用自己的 DNS（比如 DoH），根本不读 hosts —— 既伤不到代理，也帮不上忙。
 
+### ❌ 按域名或解析 IP 封 Sift / Statsig / Sentry
+
+`b-0.hexagon-cdn.com` 是 Sift 客户的共享 CDN；`sentry.io`、Datadog intake 也是共享 SaaS。按解析 IP 写规则会误伤同 CDN 上的其他站点，IP 一变规则就脱靶。按域名写防火墙规则要依赖系统观察到 DNS 查询，代理用 DoH 时永远观察不到；hosts 又会被代理绕过。这两条都不可验证，本项目不采用。完整版的按进程封不依赖这些地址，是更可靠的边界。
+
 ### ❌ 只封 IPv4
 
 Anthropic 有 IPv6（`2607:6bc0::10`）。而大部分 TUN 代理不承载 IPv6。今天没有 IPv6 不代表明天没有。
@@ -332,10 +375,16 @@ Claude Desktop 包内还有 `cowork-svc.exe`、`chrome-native-host.exe` 等；�
 |---|---|
 | 已知程序 → 已知地址 | ✅ 基础版 + 完整版 |
 | 已知程序 → **未知/新增**地址 | ✅ 完整版（按进程封，不看目的地） |
+| 已知程序 → 第三方遥测地址（Sift / Sentry / Datadog） | ✅ 完整版（按进程）；❌ 基础版（不在 Anthropic 网段） |
 | **未知程序** → 已知地址 | ✅ 基础版（按目的地封，不看程序） |
 | **未知程序 → 未知地址** | ❌ **没有覆盖** |
+| 浏览器 → claude.ai / Sift 信标 | ⚠️ 基础版只封 Anthropic 网段；完整版不覆盖浏览器进程 |
+| DNS 查询本身（域名暴露给本地 / 运营商 DNS） | ❌ 不在本项目范围；`04-network-audit.ps1` 只描述配置，不改变 DNS |
+| 原生客户端的随机安装 ID / 账户关联 | ❌ 不在本项目范围；本工具只处理 IP 直连 |
 
 最后一格只能靠「物理网卡默认拒绝 + 只放行代理程序」这种全机 kill-switch 来关。那个方案的代价是：开机到启动代理之间整机没网、代理节点变了会把自己锁在外面。本项目**不包含**它，因为对大多数人不划算。如果你想要，思路在 [docs/verification.md](docs/verification.md) 里有描述（临时全机墙那一节就是它的临时版本）。
+
+桌面端和网页端要分开看：研究显示 Anthropic 原生客户端用的是随机安装 ID，不是硬件机器码；网页端 Sift 指纹针对的是浏览器环境。kill-switch 管的是「代理挂了不要从大陆 IP 直连」，不是「让账号在 Anthropic 侧不可关联」。换账户、换浏览器、换网络这些关联面，不在防火墙规则能解决的范围里。
 
 另外：
 
@@ -359,13 +408,14 @@ Claude Desktop 包内还有 `cowork-svc.exe`、`chrome-native-host.exe` 等；�
 
 | 文件 | 作用 |
 |---|---|
-| `scripts/00-check.ps1` | 环境体检，**只读**，什么都不改（含防火墙 profile、ActiveStore、网卡覆盖核对） |
+| `scripts/00-check.ps1` | 环境体检，**只读**，什么都不改（含防火墙 profile、ActiveStore、网卡覆盖、Anthropic/Sift 端点解析） |
 | `scripts/01-basic.ps1` | 基础防护：按目的地封 Anthropic 网段；同名不健康的规则原地修复 |
 | `scripts/02-full-install.ps1` | 完整防护：按进程封 + 装自动重建任务 |
 | `scripts/02-full-rebuild.ps1` | 被计划任务调用的重建脚本（只增不删） |
 | `scripts/ks-lib.ps1` | 共享判断函数库（规则健康判定、门禁、清理），被主脚本和测试引用 |
 | `scripts/03-verify.ps1` | 诱饵验证，证明规则真的会开火 |
 | `scripts/04-network-audit.ps1` | 可选的只读 DNS、HTTP 代理出口与独立 UDP/STUN 诊断 |
+| `scripts/05-coverage.ps1` | 只读覆盖核对：ActiveStore 生效性、基础/完整规则对当前 Claude 程序、Anthropic 与 Sift 端点的覆盖，带退出码 |
 | `scripts/ks-stun.ps1` | 严格解析 STUN 应答（包含事务 ID 校验与 IPv4/IPv6 地址） |
 | `scripts/99-uninstall.ps1` | 全部撤销（先停计划任务再删规则） |
 | `docs/verification.md` | 完整的零泄漏验证流程 |
@@ -380,8 +430,9 @@ Claude Desktop 包内还有 `cowork-svc.exe`、`chrome-native-host.exe` 等；�
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1
 ```
 
-- **单元测试**：85 条断言全绿。覆盖规则健康四场景（禁用 / 改地址 / 缺新网卡 / 健康）、`-TestAnthropic` 门禁与退出码语义、发现源失败传播、路由按完整身份清理、安装目录 ACL 判定，以及 STUN IPv4/IPv6 解析、事务 ID 与畸形应答处理。
+- **单元测试**：130 条断言全绿。覆盖规则健康四场景（禁用 / 改地址 / 缺新网卡 / 健康）、`-TestAnthropic` 门禁与退出码语义、发现源失败传播、路由按完整身份清理、安装目录 ACL 判定、STUN IPv4/IPv6 解析与畸形应答，以及新增的 CIDR / 点分掩码判定、端点目录、IPv4+IPv6 进程覆盖和覆盖退出码语义。
 - **真机验证**（2026-11，Windows 11 + sing-box TUN + v2rayN，WLAN）：诱饵 A/B（按目的地、按程序）实测开火；`-TestAnthropic` 在 Claude CLI 存活时实测拒绝执行（退出码 `2`）；同名规则缺网卡绑定实测被 `Set-NetFirewallRule` 原地修复；测试路由按完整身份清理、零残留。IPv6 / UDP/QUIC 路径与拔插头端到端测试未在本机做。
+- **只读覆盖核对**（2026-11-23，Windows 11 / PowerShell 5.1）：实测 `s-cdn.anthropic.com` CNAME → `b-0.hexagon-cdn.com` → `34.54.194.141`，`statsig.anthropic.com` 权威 DNS 返回 NXDOMAIN；`05-coverage.ps1` 能从自定义 npm prefix 的 `.npmrc` 发现 CLI，把缺失网段、防火墙 profile 关闭、WindowsApps 枚举失败分别归类为覆盖缺口或无法完整核对，不会报假成功。该环境不满足阻断类验证的前置条件，本次未执行 03-verify 的实测部分。
 
 ---
 

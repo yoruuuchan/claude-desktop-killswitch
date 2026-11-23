@@ -71,6 +71,75 @@ $blocked = ($LASTEXITCODE -ne 0)      # ← 错的
 
 ---
 
+## 第三方遥测覆盖核对（只读，不发起连接）
+
+`05-coverage.ps1` 解决的是另一个问题：规则还在不在正确的位置，以及已知第三方端点解析到哪里。
+
+```powershell
+.\scripts\05-coverage.ps1
+```
+
+它只读本机配置、已装规则和系统 DNS，不创建规则、不建立 TCP/TLS 连接。退出码：
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 已安装的防护层健康，没有发现具体覆盖缺口 |
+| `1` | 发现覆盖缺口（规则缺失 / 不健康、防火墙 profile 关闭、基础层未安装等） |
+| `2` | 无法完整核对（规则或 DNS 读取失败、完整版已装但找不到目标） |
+
+它核对四件事：
+
+1. Windows 防火墙 profile 是否开启；项目规则是否在 ActiveStore 中且已启用。关闭或未生效时，所有规则都是摆设。
+2. 基础版的三个必装规则是否仍健康，地址覆盖是否包含 Anthropic 官方 IPv4 + IPv6 网段。
+3. 完整版是否覆盖当前机器上发现的全部 Claude 程序（Desktop 包、扩展目录、Claude Code CLI），且每个程序同时有 IPv4 和 IPv6 规则。
+4. 已知端点解析到哪里：Anthropic 官方端点、Sift 的 `s-cdn.anthropic.com` / `b-0.hexagon-cdn.com`，以及历史条目 `statsig.anthropic.com`。
+
+如果 `05-coverage.ps1` 报防火墙关闭，先修这个再谈阻断类验证 —— 防火墙关闭的机器上，03-verify 的诱饵测试没有意义。
+
+### 手动复核 DNS 链
+
+本地解析器可能把 CNAME 压平成 A 记录，直接 `Resolve-DnsName` 看不到 CNAME。用 DoH 复核（经你自己的代理，不直连目标）：
+
+```powershell
+curl.exe -x http://127.0.0.1:10808 -H 'accept: application/dns-json' `
+  'https://cloudflare-dns.com/dns-query?name=s-cdn.anthropic.com&type=A'
+```
+
+2026-11-23 的实测结果（节选）：
+
+```json
+{"name":"s-cdn.anthropic.com","data":"b-0.hexagon-cdn.com."}
+{"name":"b-0.hexagon-cdn.com","data":"34.54.194.141"}
+```
+
+`statsig.anthropic.com` 在同一天返回 NXDOMAIN（Status 3）。旧版 README 里的 `34.36.57.103` 已经不能当作当前地址；完整版按进程封，不依赖这个域名。
+
+Sift 的 79 个字段、证书归属和登录态上报细节来自 [riba2534 的 2026-11 研究](https://x.com/riba2534/status/2124194803575607364)；本仓库复现的是当前 DNS 链，没有复现它的沙箱抓包。
+
+### 这份核对能证明什么、不能证明什么
+
+| 能证明 | 不能证明 |
+|---|---|
+| 已装规则是否仍健康、是否覆盖当前程序和物理网卡 | Claude 实际访问了哪个端点（需要抓包） |
+| 当前 DNS 把 Sift 端点解析到哪里 | Sift 的 79 个字段是否真的全部上报（第三方研究） |
+| 基础版是否覆盖 Anthropic 官方网段 | 浏览器里的第三方信标是否已经发出 |
+| 完整版是否覆盖 Claude 程序的所有公网目的地 | Anthropic 服务端如何使用 Sift 分数（外部不可见） |
+
+### 为什么不按 Sift 的 IP 建规则
+
+`b-0.hexagon-cdn.com` 是 Sift 客户的共享 CDN，IP 会变；研究记录同一张证书还覆盖其他 Sift 客户。按解析 IP 写规则会误伤同 CDN 上的其他站点，IP 变了规则就脱靶。按域名写防火墙规则依赖系统观察到 DNS 查询，代理用 DoH 时观察不到；hosts 又会被代理绕过。这两种做法都不可验证，本项目不采用。
+
+可靠的做法只有两种：
+
+- 用完整版按进程封住 Claude 程序的所有公网目的地；Sift 换地址也不影响。
+- 或者不在代理失效期间继续使用已打开的 claude.ai 页面；浏览器不在按进程规则范围内。
+
+### 桌面端与网页端
+
+网页端的 Sift 信标针对浏览器环境；研究显示 Anthropic 原生客户端使用随机安装 ID，不是硬件机器码。kill-switch 只处理「代理挂了不要从大陆 IP 直连」这一层，不处理账户、邮箱、支付方式、浏览器指纹之间的服务端关联。别把「没直连」误读成「不可关联」。
+
+---
+
 ## 第二阶段：直接验证 Anthropic 规则（风险极小）
 
 ```powershell

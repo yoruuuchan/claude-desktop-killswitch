@@ -39,12 +39,13 @@ $Group = 'Claude-KS'
 # Sources: https://platform.claude.com/docs/en/api/ip-addresses
 #          https://bgp.he.net/AS399358
 # --------------------------------------------------------------------------
-$AnthropicV4 = @('160.79.104.0/23', '153.61.224.0/22')
-$AnthropicV6 = @('2607:6bc0::/48', '2607:6bc0:11::/48')
+$anthroRanges = Get-KSAnthropicRanges
+$AnthropicV4 = $anthroRanges.V4
+$AnthropicV6 = $anthroRanges.V6
 
 # 全部 IPv6 出公网 = 全球单播 + NAT64。
 # 故意不含 fe80::/10（链路本地）和 fc00::/7（ULA，Tailscale 用这个）。
-$AllV6 = @('2000::/3', '64:ff9b::/96', '64:ff9b:1::/48')
+$AllV6 = (Get-KSPublicAddressSets).V6
 
 
 function Fail($m) { Write-Host "  [失败] $m" -ForegroundColor Red; exit 1 }
@@ -127,11 +128,8 @@ function New-KSRule {
 Write-Host ''
 # Preserve the existing IPv4 block and install the new range as a separate rule.
 # New-KSRule skips existing names, so changing only the address list would not upgrade old installs.
-New-KSRule -Name 'KS - Block Anthropic IPv4 on physical' -Remote @('160.79.104.0/23')
-New-KSRule -Name 'KS - Block Anthropic IPv4 153.61.224.0-22 on physical' -Remote @('153.61.224.0/22')
-New-KSRule -Name 'KS - Block Anthropic IPv6 on physical' -Remote $AnthropicV6
-if ($BlockAllIPv6) {
-    New-KSRule -Name 'KS - Block all IPv6 on physical' -Remote $AllV6
+foreach ($spec in (Get-KSBasicRuleSpecs -BlockAllIPv6:$BlockAllIPv6)) {
+    New-KSRule -Name $spec.Name -Remote $spec.Remote
 }
 
 # ---- 验证：每条规则都要真的健康（同名 ≠ 有效）----
@@ -139,14 +137,7 @@ if ($BlockAllIPv6) {
 # 新增物理网卡（USB 网卡 / 扩展坞）后旧规则不再覆盖新网卡 —— 这三种情况下
 # 脚本仍然必须报失败，不能报 OK。对安全工具来说 fail-open 是致命的。
 Write-Host ''
-$expectedSpecs = @(
-    @{ Name = 'KS - Block Anthropic IPv4 on physical';                 Remote = @('160.79.104.0/23') }
-    @{ Name = 'KS - Block Anthropic IPv4 153.61.224.0-22 on physical'; Remote = @('153.61.224.0/22') }
-    @{ Name = 'KS - Block Anthropic IPv6 on physical';                 Remote = $AnthropicV6 }
-)
-if ($BlockAllIPv6) {
-    $expectedSpecs += @{ Name = 'KS - Block all IPv6 on physical'; Remote = $AllV6 }
-}
+$expectedSpecs = Get-KSBasicRuleSpecs -BlockAllIPv6:$BlockAllIPv6
 
 $bad = @()
 $allKs = @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue)
